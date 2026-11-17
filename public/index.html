@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#131e36">
+  <title>恒序进销存</title><link rel="icon" href="/favicon.svg">
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <div id="app"><div class="initial"><span class="brand-mark">恒</span><p>正在打开恒序进销存</p></div></div>
+  <dialog id="editor"></dialog>
+  <dialog id="document-picker" aria-labelledby="picker-heading"></dialog>
+  <dialog id="system-prompt" aria-labelledby="system-prompt-title" aria-describedby="system-prompt-message">
+    <form method="dialog">
+      <header class="system-prompt-header">
+        <h2 id="system-prompt-title">系统提示</h2>
+        <button type="submit" class="system-prompt-close" value="cancel" aria-label="关闭提示">×</button>
+      </header>
+      <div class="system-prompt-content">
+        <span class="system-prompt-icon" aria-hidden="true">i</span>
+        <p id="system-prompt-message"></p>
+      </div>
+      <footer class="system-prompt-actions">
+        <button type="submit" value="cancel" class="system-prompt-cancel">取消</button>
+        <button type="submit" value="confirm" class="system-prompt-confirm">确定</button>
+      </footer>
+    </form>
+  </dialog>
+</body>
+</html>

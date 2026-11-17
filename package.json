@@ -1,0 +1,1 @@
+{"name":"hengxu-inventory","private":true,"type":"module","engines":{"node":">=24"},"scripts":{"start":"node src/server.js","test":"node --test"}}

@@ -1,0 +1,11 @@
+data/
+.DS_Store
+
+._*
+
+.codex-attachments/
+.env
+.env.*
+node_modules/
+*.sqlite*
+*.backups/

@@ -1,11 +1,13 @@
-import { families, stockEffects, settlementFooters, logisticsFooters } from './catalog.js';
+import { families, stockEffects, settlementFooters, logisticsFooters, settlementTypes } from './catalog.js';
 
 export const fieldSections = [['head','表头字段'], ['headCustom','表头自定义'], ['body','表体字段'], ['bodyCustom','表体自定义'], ['foot','表尾字段']];
 const field = (key,label,kind='文本',locked=false,readOnly=false) => ({key,label,kind,locked,readOnly});
+const hiddenField = (key,label,kind) => ({...field(key,label,kind),hidden:true});
 const custom = prefix => [1,2,3].map(i=>({...field(prefix+i,'自定义字段 '+i),hidden:true}));
 
 export function documentFields(type) {
   const [,,,party,effect]=families[type];
+  const opening=type==='openingStock';
   const buy=party==='supplier', cash=effect==='cash', fee=effect==='fee', journal=effect==='journal';
   const settlement=settlementFooters.includes(type), shipping=logisticsFooters.includes(type);
   const salesHeader=['sale','salesOrder'].includes(type), inbound=type==='purchase', target=effect==='transfer'||type==='transferOrder';
@@ -25,11 +27,11 @@ export function documentFields(type) {
     body:cash?[]:journal?[
       field('ledgerAccount','会计科目','选择',true),field('debit','借方金额','数值'),field('credit','贷方金额','数值'),field('note','明细备注')
     ]:[
-      field('batch','批次号'),field('production','生产日期','日期'),field('product','商品编号 / 名称','选择',true),
-      field('barcode','条码','文本',false,true),field('serials','序列号'),
+      hiddenField('batch','批次号'),hiddenField('production','生产日期','日期'),field('product','商品编号 / 名称','选择',true),
+      field('barcode','条码','文本',false,true),hiddenField('serials','序列号'),
       ...(effect==='exchange'?[field('direction','换货方向','选择',true)]:[]),
-      field('quantity','数量','数值',true),field('unit','单位','选择',false,true),field('price','不含税单价','数值'),
-      field('discount','明细折扣','数值'),field('tax','税率 %','数值'),field('expiry','到期日期','日期'),
+      field('quantity',opening?'期初数量':'数量','数值',true),field('unit','单位','选择',false,true),field('price',opening?'成本单价':'不含税单价','数值'),
+      field('discount','明细折扣','数值'),field('tax','税率 %','数值'),hiddenField('expiry','到期日期','日期'),
       field('source','价格来源','文本',false,true),field('note','明细备注')
     ],
     bodyCustom:cash?[]:custom('customLine'),
@@ -37,7 +39,7 @@ export function documentFields(type) {
       ...(cash||fee?[field('amount','金额','数值',true)]:journal?[]:[
         field('discount','整单折扣','数值'),field('reduction','整单优惠','数值'),field('freight',type==='sale'?'买家运费':'运费','数值')]),
       ...(settlement?[field('advance',buy?'用预付款':'用预收款','数值'),field('paid',buy?'本单付款金额':'本单收款金额','数值')]:[]),
-      ...(cash&&!['openingAR','openingAP'].includes(type)||fee||settlement?[field('account','资金账户','选择',cash&&!['openingAR','openingAP'].includes(type)||fee)]:[]),
+      ...(cash&&!['openingAR','openingAP'].includes(type)||fee||settlement?[field('account',settlementTypes.includes(type)?'结算账户':'资金账户','选择',cash&&!['openingAR','openingAP'].includes(type)||fee)]:[]),
       ...(type==='cashTransfer'?[field('targetAccount','转入账户','选择',true)]:[]),
       ...(['expense','income','deferred'].includes(type)?[field('subject','费用/收入科目','选择')]:[]),
       ...(shipping?[field('address','收货信息'),field('deliveryName','收货人'),field('deliveryPhone','收货电话'),
@@ -95,4 +97,45 @@ export function copyFieldRules(fromType,toType,from,to) {
     }
   }
   return normalizeFieldRules(toType,merged);
+}
+
+// Line positions are unique within a source document.
+export function uniqueSourceLines(source) {
+  return [...new Map(source.lines.map(line=>[line.position,line])).values()];
+}
+
+export async function loadDocumentSource(editor,{load,isCurrent,apply,setLoading}) {
+  if (editor.sourceLoading) return;
+  editor.sourceLoading=true;
+  editor.sourceVersion=(editor.sourceVersion||0)+1;
+  try {
+    setLoading(true);
+    const source=await load();
+    if (isCurrent()) apply(source);
+  } finally {
+    editor.sourceLoading=false;
+    setLoading(false);
+  }
+}
+
+export function isLinkedReturn(editor) {
+  return ['purchaseReturn','salesReturn'].includes(editor.type)&&!!editor.reference?.lines;
+}
+
+export function existingReturnLine(editor,product,unit,target) {
+  if (!isLinkedReturn(editor)||!editor.reference.lines.some(line=>Number(line.product)===Number(product))) return;
+  const matches=editor.lines.filter(line=>Number(line.product)===Number(product));
+  if (matches.includes(target)) return target;
+  return matches.find(line=>unit==null||line.unit===unit)||matches[0];
+}
+
+export function mergeReturnLine(editor,product,quantity,{target,unit,factors}={}) {
+  if (editor.sourceLoading) return true;
+  const existing=existingReturnLine(editor,product,unit,target);
+  if (!existing) return false;
+  if (existing!==target) {
+    const factor=unit==null?1:(factors?.get(unit)||1)/(factors?.get(existing.unit)||1);
+    existing.quantity=Number((Number(existing.quantity||0)+Number(quantity)*factor).toFixed(editor.precision.quantityDigits));
+  }
+  return true;
 }

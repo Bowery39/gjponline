@@ -1,7 +1,7 @@
 import { documentTypesFor } from '../public/permissions.js';
-import { unitPrice } from '../public/system-settings.js';
+import { unitPrice, unsettledDocumentTypes } from '../public/system-settings.js';
 import { families, reports, statusNames, orderFulfillment } from '../public/catalog.js';
-import { check, parse, today } from './engine.js';
+import { check, orderExecution, parse, today } from './engine.js';
 
 const cash = n => (n / 100).toFixed(2);
 const quantity = n => +(n / 1000).toFixed(4);
@@ -68,12 +68,48 @@ export function listDocuments(s,user,query) {
   if (query.to) { conditions.push('d.date<=?'); params.push(query.to); }
   if (query.warehouse) {conditions.push('(d.warehouse=? OR d.target=?)');params.push(Number(query.warehouse),Number(query.warehouse));}
   if (query.partner) {conditions.push('d.partner=?');params.push(Number(query.partner));}
+  for (const [key,operator] of [['minAmount','>='],['maxAmount','<=']]) {
+    if (query[key]===undefined||query[key]==='') continue;
+    const amount=Number(query[key]);
+    check(Number.isFinite(amount)&&Math.abs(amount)<=1e10,'请输入有效的金额区间');
+    conditions.push('d.total'+operator+'?');
+    params.push(Math.round(amount*100));
+  }
+  if (query.minAmount!==undefined&&query.maxAmount!==undefined&&query.minAmount!==''&&query.maxAmount!=='')
+    check(Number(query.minAmount)<=Number(query.maxAmount),'最低金额不能大于最高金额');
   const from = `FROM documents d LEFT JOIN master p ON d.partner=p.id LEFT JOIN master w ON d.warehouse=w.id
     WHERE ${conditions.join(' AND ')}`;
-  if (query.countOnly) return {count:s.one('SELECT count(*) count '+from,...params).count};
-  const rows = s.all(`SELECT d.id,d.type,d.status,d.number,d.date,d.total,p.name partnerName,w.name warehouseName,
-    json_extract(d.data,'$.summary') summary ${from} ORDER BY d.id DESC LIMIT ? OFFSET ?`,...params,query.export ? 100000 : 25,query.export ? 0 : (page-1)*25);
-  return {rows,page};
+  if (query.countOnly&&!query.onlyUnpaid) return {count:s.one('SELECT count(*) count '+from,...params).count};
+  const amounts = `SELECT d.id,d.type,d.status,d.number,d.date,d.total,d.partner,p.name partnerName,w.name warehouseName,
+    json_extract(d.data,'$.summary') summary,json_extract(d.data,'$.reversalOf') reversalOf,
+    EXISTS(SELECT 1 FROM documents r WHERE json_extract(r.data,'$.reversalOf')=d.id) reversed,
+    COALESCE(json_extract(d.data,'$.reduction'),0) reduction,
+    COALESCE((SELECT SUM((CASE WHEN d.type IN ('exchange','purchaseExchange') AND json_extract(l.data,'$.direction')='return'
+      THEN -1 ELSE 1 END)*COALESCE(json_extract(l.data,'$.enteredQuantity'),l.quantity))/1000.0 FROM lines l WHERE l.doc=d.id AND l.product IS NOT NULL),0) quantity,
+    COALESCE((SELECT SUM((CASE WHEN d.type IN ('exchange','purchaseExchange') AND json_extract(l.data,'$.direction')='return'
+      THEN -1 ELSE 1 END)*(l.net+l.tax)) FROM lines l WHERE l.doc=d.id AND l.product IS NOT NULL),d.total) gross,
+    CASE WHEN d.status IN ('posted','settled') AND d.total>=0 AND d.type IN ('purchase','sale','exchange','purchaseExchange')
+      THEN d.total-COALESCE((SELECT SUM(amount) FROM ledger WHERE reference=d.id AND entity=d.partner
+        AND category=CASE WHEN d.type IN ('purchase','purchaseExchange') THEN 'ap' ELSE 'ar' END),0)
+      ELSE COALESCE((SELECT SUM(paid.total) FROM documents paid WHERE d.status IN ('posted','settled')
+        AND (d.type IN ('purchaseReturn','salesReturn') OR (d.type IN ('exchange','purchaseExchange') AND d.total<0))
+        AND paid.type IN ('payment','receipt') AND paid.status IN ('posted','settled') AND json_extract(paid.data,'$.reference')=d.id),
+        COALESCE(json_extract(d.data,'$.paid'),0)+COALESCE(json_extract(d.data,'$.advance'),0)+
+        COALESCE((SELECT SUM(json_extract(value,'$.amount')) FROM json_each(d.data,'$.receipts')),0)) END settled ${from}`;
+  const outstanding="CASE WHEN type IN ("+unsettledDocumentTypes.map(type=>"'"+type+"'").join(',')+") THEN ABS(total)-settled ELSE NULL END";
+  const selected=`SELECT *,${outstanding} outstanding FROM (${amounts})${query.onlyUnpaid?' WHERE total>0 AND ABS(total)-settled>0':''}`;
+  if (query.countOnly) return {count:s.one('SELECT COUNT(*) count FROM ('+selected+')',...params).count};
+  const rows = s.all(`SELECT * FROM (${selected}) ORDER BY id DESC LIMIT ? OFFSET ?`,
+    ...params,query.export ? 100000 : 25,query.export ? 0 : (page-1)*25);
+  const totals=s.one(`SELECT COUNT(*) count,COUNT(outstanding) unsettledCount,${['quantity','gross','reduction','settled','total','outstanding'].map(key=>
+    'COALESCE(SUM('+key+'),0) '+key).join(',')} FROM (${selected})`,...params);
+  if (!totals.unsettledCount) totals.outstanding=null;
+  if (!query.export) for (const row of rows) {
+    if (!Object.hasOwn(orderFulfillment,row.type)) continue;
+    const lines=s.all('SELECT position,product,quantity FROM lines WHERE doc=? ORDER BY position',row.id);
+    row.executionState=orderExecution(s,user,{...row,lines}).state;
+  }
+  return {rows,page,count:totals.count,totals};
 }
 const table = (columns,rows,extra={}) => ({columns,rows,...extra});
 export function report(s,user,name,q) {
@@ -86,6 +122,9 @@ export function report(s,user,name,q) {
   check(!warehouse || !warehouseIds.length || warehouseIds.includes(warehouse),'超出仓库权限',403);
   const stockScope = (alias) => warehouse ? [`AND ${alias}.warehouse=?`,[warehouse]]
     : warehouseIds.length ? [`AND ${alias}.warehouse IN (${warehouseIds.map(()=>'?').join(',')})`,warehouseIds] : ['',[]];
+  const category=name==='库存状况查询'?String(q.category||''):'';
+  const categoryFilter=category?"AND (json_extract(p.data,'$.category')=? OR substr(json_extract(p.data,'$.category'),1,length(?)+1)=?||'/')":'';
+  const categoryArgs=category?[category,category,category]:[];
   const matches = (row) => !q.keyword || row.map(String).join(' ').toLowerCase().includes(q.keyword.trim().toLowerCase());
   const result = (columns, rows, extra) => table(columns,rows.filter(matches),extra);
   const documentRows = (columns, records, format) => {
@@ -106,7 +145,7 @@ export function report(s,user,name,q) {
       SUM(st.quantity) quantity,SUM(st.value) value,COUNT(DISTINCT st.warehouse) warehouses,
       (SELECT MIN(m.date) FROM movements m WHERE m.product=p.id AND m.warehouse=st.warehouse AND m.quantity>0) firstIn
       FROM stock st JOIN master p ON st.product=p.id JOIN master w ON w.id=st.warehouse
-      WHERE (?=1 OR p.active=1) AND (?='' OR COALESCE(json_extract(p.data,'$.method'),'moving')=?) ${filter} GROUP BY p.id${detail?',st.warehouse':''} ORDER BY p.code`,q.inactive==='1'?1:0,q.method||'',q.method||'',...params);
+      WHERE (?=1 OR p.active=1) AND (?='' OR COALESCE(json_extract(p.data,'$.method'),'moving')=?) ${filter} ${categoryFilter} GROUP BY p.id${detail?',st.warehouse':''} ORDER BY p.code`,q.inactive==='1'?1:0,q.method||'',q.method||'',...params,...categoryArgs);
     const reservations = s.all(`SELECT r.product,r.warehouse,SUM(MAX(0,r.quantity-COALESCE(done.quantity,0))) quantity
       FROM (SELECT d.id,l.product,d.warehouse,SUM(l.quantity) quantity FROM lines l JOIN documents d ON d.id=l.doc
         WHERE d.type IN ('salesOrder','transferOrder') AND d.status IN ('approved','posted') AND ${sql}
@@ -143,7 +182,7 @@ export function report(s,user,name,q) {
   if (q.view==='serial') {
     const [filter,params] = stockScope('a');
     const rows=s.all(`SELECT p.code,p.name,w.name warehouse,a.batch,a.serial FROM serials a JOIN master p ON p.id=a.product
-      JOIN master w ON w.id=a.warehouse WHERE 1=1 ${filter} ORDER BY p.code,a.serial`,...params);
+      JOIN master w ON w.id=a.warehouse WHERE 1=1 ${filter} ${categoryFilter} ORDER BY p.code,a.serial`,...params,...categoryArgs);
     return result(['商品编号','商品名称','仓库','批次号','序列号'],rows.map(r=>Object.values(r)));
   }
   if (q.view==='bundle') {
@@ -227,20 +266,74 @@ export function report(s,user,name,q) {
       if (!groups.has(key)) groups.set(key,{name:row.entityName,no:row.referenceNumber||'未指定单据',ar:0,ap:0,advanceIn:0,advanceOut:0,paid:0,opening:0});
       const group=groups.get(key);
       group[row.category]+=row.amount;
-      if (row.date>=from && ['receipt','payment'].includes(row.type)) group.paid-=row.amount;
-      if (row.date<from && ['ar','ap'].includes(row.category)) group.opening+=row.amount;
+      if (row.date>=from&&['receipt','payment'].includes(row.type)&&['ar','ap'].includes(row.category)) group.paid-=row.amount;
+      if ((row.date<from||row.type.startsWith('opening')) && ['ar','ap'].includes(row.category)) group.opening+=row.amount;
     }
-    if (name==='对账' || name==='按单结算查询') return documentRows(['日期','单据编号','关联单据','往来单位','科目','发生额'],
-      partnerRows(period).filter(r=>['ar','ap','advanceIn','advanceOut'].includes(r.category)),
-      r=>[r.date,r.number,r.referenceNumber||'',r.entityName,({ar:'应收',ap:'应付',advanceIn:'预收',advanceOut:'预付'})[r.category],cash(r.amount)]);
-    return accountResult(byDoc?['单据编号','往来单位','应收余额','应付余额','期间结算']:['往来单位','应收余额','应付余额','预收余额','预付余额'],[...groups.values()].map(r=>byDoc?[r.no,r.name,cash(r.ar),cash(r.ap),cash(r.paid)]:[r.name,cash(r.ar),cash(r.ap),cash(r.advanceIn),cash(r.advanceOut)]));
+    const labels={ar:'应收',ap:'应付',advanceIn:'预收',advanceOut:'预付'};
+    if (name==='对账' || name==='按单结算查询') {
+      const format=r=>[r.date,r.number,r.referenceNumber||'',r.entityName,labels[r.category],cash(r.amount)];
+      const records=partnerRows(entries).filter(r=>Object.hasOwn(labels,r.category));
+      const detail=documentRows(['日期','单据编号','关联单据','往来单位','科目','发生额'],records.filter(r=>r.date>=from&&!r.type.startsWith('opening')),format);
+      if (name==='按单结算查询') return detail;
+      const summary=new Map();
+      const matchesParty=new Set(records.filter(r=>matches(format(r))||phonePartners.includes(r.entityName)).map(r=>r.entity));
+      for (const row of records) {
+        if (!matchesParty.has(row.entity)) continue;
+        const key=row.entity+'|'+row.category;
+        if (!summary.has(key)) summary.set(key,{name:row.entityName,category:labels[row.category],opening:0,increase:0,decrease:0});
+        const total=summary.get(key);
+        if (row.date<from||row.type.startsWith('opening')) total.opening+=row.amount;
+        else if (row.amount>0) total.increase+=row.amount;
+        else total.decrease-=row.amount;
+      }
+      const initial=[...summary.values()].reduce((sum,row)=>sum+row.opening,0);
+      detail.rows.unshift(['','期初余额','','','',cash(initial)]);
+      detail.documentIds?.unshift(null);
+      return {...detail,summary:table(['往来单位','科目','期初余额','本期增加','本期减少','期末余额'],
+        [...summary.values()].map(r=>[r.name,r.category,cash(r.opening),cash(r.increase),cash(r.decrease),cash(r.opening+r.increase-r.decrease)]))};
+    }
+    const result=accountResult(byDoc?['单据编号','往来单位','应收余额','应付余额','期间结算']:['往来单位','应收余额','应付余额','预收余额','预付余额'],[...groups.values()].map(r=>byDoc?[r.no,r.name,cash(r.ar),cash(r.ap),cash(r.paid)]:[r.name,cash(r.ar),cash(r.ap),cash(r.advanceIn),cash(r.advanceOut)]));
+    if (!byDoc) result.totalRow=['合计',...[1,2,3,4].map(index=>cash(result.rows.reduce((sum,row)=>sum+Math.round(Number(row[index])*100),0)))];
+    if (!byDoc) {
+      const initial=partnerRows(entries).filter(row=>row.type.startsWith('opening')&&Object.hasOwn(labels,row.category));
+      const map=new Map();
+      for (const row of initial) {
+        if (!map.has(row.entity)) map.set(row.entity,{name:row.entityName,ar:0,ap:0,advanceIn:0,advanceOut:0});
+        map.get(row.entity)[row.category]+=row.amount;
+      }
+      result.summary=table(['往来单位','期初余额（应收）','期初余额（应付）','期初余额（预收）','期初余额（预付）'],
+        [...map.values()].filter(row=>matches([row.name])||phonePartners.includes(row.name)).map(row=>[row.name,...['ar','ap','advanceIn','advanceOut'].map(key=>cash(row[key]))]));
+    }
+    return result;
   }
   if (name==='现金银行变动表' || name==='费用及其他收入统计') {
     const categories=name==='现金银行变动表'?['cash']:['expense','income','deferred','salesFee'];
     return documentRows(['日期','单据编号','单据类型','账户或科目','金额'],period.filter(r=>categories.includes(r.category)),r=>[r.date,r.number,families[r.type][0],r.entityName||'',cash(r.amount)]);
   }
   const revenue=sum('sales'), cost=sum('cogs'), fee=sum('salesFee'), other=sum('income'), expenses=sum('expense');
-  if (name==='利润表') return table(['项目','金额'],[['营业收入',revenue],['营业成本',cost],['销售费用',fee],['其他收入',other],['其他费用',expenses],['经营利润',revenue-cost-fee+other-expenses]].map(([k,v])=>[k,cash(v)]));
+  if (name==='利润表') {
+    const journal=s.all(`SELECT j.*,d.type FROM journal_entries j JOIN documents d ON d.id=j.doc
+      WHERE ${sql} ${ledgerFilter} AND j.date<=? AND j.category IN ('income','expense')
+      ORDER BY j.id`,...args,...(warehouse?[warehouse,warehouse]:[]),to);
+    const values={营业收入:0,营业成本:0,销售费用:0,其他收入:0,其他费用:0,优惠收入:0,优惠支出:0,报溢收入:0,报损损失:0,其他损益:0};
+    for (const row of journal.filter(row=>row.date>=from)) {
+      if (row.code==='6603') {
+        const purchase=row.type.startsWith('purchase');
+        values[purchase?'优惠收入':'优惠支出']+=(purchase?-1:1)*row.amount;
+      }
+      else if (row.code==='6001') values.营业收入-=row.amount;
+      else if (row.code==='6401') values.营业成本+=row.amount;
+      else if (row.code==='6601') values.销售费用+=row.amount;
+      else if (row.code==='6051') values.其他收入-=row.amount;
+      else if (row.code==='6602') values.其他费用+=row.amount;
+      else if (row.code==='6711'&&row.type==='gain') values.报溢收入-=row.amount;
+      else if (row.code==='6711'&&row.type==='loss') values.报损损失+=row.amount;
+      else values.其他损益-=row.amount;
+    }
+    const opening=journal.filter(row=>row.date<from).reduce((sum,row)=>sum-row.amount,0);
+    const profit=journal.filter(row=>row.date>=from).reduce((sum,row)=>sum-row.amount,0);
+    return table(['项目','金额'],[...Object.entries(values),['经营利润',profit],['期初累计损益',opening],['本期净利润',profit],['净利润',opening+profit]].map(([key,value])=>[key,cash(value)]));
+  }
   if (['资产负债表','会计分录查询'].includes(name)) {
     if (name==='会计分录查询') {
       const rows=s.all(`SELECT j.*, d.id documentId,d.number, m.name entityName FROM journal_entries j
@@ -253,24 +346,32 @@ export function report(s,user,name,q) {
       WHERE ${sql} ${ledgerFilter} AND j.date<=? GROUP BY j.code,j.name,j.category ORDER BY j.code`,
       ...args,...(warehouse?[warehouse,warehouse]:[]),to);
     const categoryName={asset:'资产',liability:'负债',equity:'权益',other:'未分类'};
-    const balanceItems=rows.filter(r=>!['income','expense'].includes(r.category));
+    const balanceItems=rows.filter(r=>!['income','expense'].includes(r.category)&&(r.category!=='equity'||r.amount!==0));
     const earnings=rows.filter(r=>['income','expense'].includes(r.category)).reduce((n,r)=>n-r.amount,0);
     const values=balanceItems.map(r=>[categoryName[r.category]||'未分类',r.code,r.name,cash(['liability','equity'].includes(r.category)?-r.amount:r.amount)]);
     values.push(['权益','','累计损益',cash(earnings)]);
-    return table(['分类','科目编号','项目','期末余额'],values);
+    const sums={资产:0,负债:0,权益:0};
+    for (const row of values) if (Object.hasOwn(sums,row[0])) sums[row[0]]+=Math.round(Number(row[3])*100);
+    return table(['分类','科目编号','项目','期末余额'],values,{summary:table(['分类合计','金额'],
+      Object.entries(sums).map(([label,value])=>[label+'合计',cash(value)]))});
   }
   if (['经营报告','综合统计月报','销售波动分析'].includes(name)) {
     const purchase=documents.filter(r=>r.type==='purchase' && r.status!=='approved');
+    const purchaseReturns=documents.filter(r=>r.type==='purchaseReturn'&&r.status!=='approved');
+    const purchaseExchanges=documents.filter(r=>r.type==='purchaseExchange'&&r.status!=='approved');
     const sales=documents.filter(r=>r.type==='sale' && r.status!=='approved');
+    const salesReturns=documents.filter(r=>r.type==='salesReturn'&&r.status!=='approved');
+    const salesExchanges=documents.filter(r=>r.type==='exchange'&&r.status!=='approved');
+    const totalOf=rows=>rows.reduce((sum,row)=>sum+row.total,0);
     const trend=new Map();
     for (const row of period.filter(r=>r.category==='sales')) {
       const key=q.mode==='month'||name==='综合统计月报'?row.date.slice(0,7):row.date;
       trend.set(key,(trend.get(key)||0)+row.amount);
     }
     const sections=[
-      {name:'资金状况',values:[['现金发生额',cash(period.filter(r=>r.category==='cash' && r.entityType==='cash').reduce((n,r)=>n+r.amount,0))],['银行发生额',cash(period.filter(r=>r.category==='cash' && r.entityType==='bank').reduce((n,r)=>n+r.amount,0))],['费用支出',cash(expenses)],['其他收入',cash(other)],['收款金额',cash(sum('cash',period.filter(r=>r.type==='receipt')))],['付款金额',cash(-sum('cash',period.filter(r=>r.type==='payment')))]]},
-      {name:'出入库分析',values:[['采购笔数',purchase.length],['采购金额',cash(purchase.reduce((n,r)=>n+r.total,0))],['销售笔数',sales.length],['销售金额',cash(sales.reduce((n,r)=>n+r.total,0))],['应付款发生额',cash(sum('ap'))],['应收款发生额',cash(sum('ar'))]]},
-      {name:'经营分析',values:[['销售及其他业务收入',cash(revenue+other)],['销售成本',cash(cost)],['销售费用分摊',cash(fee)],['毛利',cash(revenue-cost-fee)],['毛利率',revenue?((revenue-cost-fee)/revenue*100).toFixed(2)+'%':'—']]}
+      {name:'资金状况',values:[['现金发生额',cash(period.filter(r=>r.category==='cash' && r.entityType==='cash').reduce((n,r)=>n+r.amount,0))],['银行发生额',cash(period.filter(r=>r.category==='cash' && r.entityType==='bank').reduce((n,r)=>n+r.amount,0))],['费用支出',cash(expenses)],['其他收入',cash(other)],['收款金额',cash(sum('cash',period.filter(r=>r.type==='receipt')))],['付款金额',cash(-sum('cash',period.filter(r=>r.type==='payment')))],['预收金额',cash(sum('cash',period.filter(r=>r.type==='advanceIn')))],['预付金额',cash(-sum('cash',period.filter(r=>r.type==='advanceOut')))]]},
+      {name:'出入库分析',values:[['采购笔数',purchase.length],['采购金额',cash(totalOf(purchase)-totalOf(purchaseReturns)+totalOf(purchaseExchanges))],['销售笔数',sales.length],['销售金额',cash(totalOf(sales)-totalOf(salesReturns)+totalOf(salesExchanges))],['应付款发生额',cash(sum('ap'))],['应收款发生额',cash(sum('ar'))],['采购退货金额',cash(totalOf(purchaseReturns))],['销售退货金额',cash(totalOf(salesReturns))]]},
+      {name:'经营分析',values:[['销售及其他业务收入',cash(revenue+other)],['销售成本',cash(cost)],['销售费用分摊',cash(fee)],['毛利',cash(revenue-cost-fee)],['毛利率',revenue?((revenue-cost-fee)/revenue*100).toFixed(2)+'%':'—'],['优惠金额',cash(sum('discount'))]]}
     ];
     return table(['期间','销售收入'],[...trend].map(([k,v])=>[k,cash(v)]),{sections});
   }
@@ -294,7 +395,8 @@ export function report(s,user,name,q) {
   const purchasing=reports['采购'].includes(name);
   const order=name.includes('订单');
   const types=purchasing ? (order?['purchaseOrder']:['purchase','purchaseReturn','purchaseExchange']) : (order?['salesOrder']:['sale','salesReturn','exchange']);
-  const rows=s.all(`SELECT d.id,d.id documentId,d.number,d.date,d.type,d.total,d.data docData,p.name partnerName,l.*,m.code productCode,m.name productName
+  const rows=s.all(`SELECT d.id,d.id documentId,d.number,d.date,d.type,d.total,d.data docData,p.name partnerName,l.*,m.code productCode,m.name productName,
+    json_extract(m.data,'$.unit') baseUnit
     FROM documents d JOIN lines l ON l.doc=d.id JOIN master m ON m.id=l.product LEFT JOIN master p ON p.id=d.partner
     WHERE ${sql} ${ledgerFilter} AND d.date BETWEEN ? AND ? AND d.type IN (${types.map(()=>'?').join(',')})
     AND d.status IN (${order?"'approved',":''}'posted','settled') ORDER BY d.date,d.id,l.position`,...args,...(warehouse?[warehouse,warehouse]:[]),from,to,...types);
@@ -321,9 +423,11 @@ export function report(s,user,name,q) {
     const original=Math.round(untaxedPrice(r)*(parse(r.data).enteredQuantity??r.quantity)/10);
     return [r.date,r.number,r.productName,cash(original),cash(r.net),cash(original-r.net)];
   });
-  if (name.includes('明细')) return documentRows(['日期','单据编号','往来单位','商品编号','商品名称','数量','不含税单价','含税金额'],rows,r=>
-    [r.date,r.number,r.partnerName,r.productCode,r.productName,quantity(signed(r)*r.quantity),
-      untaxedPrice(r).toFixed(parse(r.docData).precision?.priceDigits??2),cash(signed(r)*(r.net+r.tax))]);
+  if (name.includes('明细')) return documentRows(['日期','单据编号','往来单位','商品编号','商品名称','数量','单位','不含税单价','含税金额'],rows,r=>{
+    const data=parse(r.data);
+    return [r.date,r.number,r.partnerName,r.productCode,r.productName,quantity(signed(r)*(data.enteredQuantity??r.quantity)),
+      data.unit||r.baseUnit||'',untaxedPrice(r).toFixed(parse(r.docData).precision?.priceDigits??2),cash(signed(r)*(r.net+r.tax))];
+  });
   if (order) return documentRows(['日期','单据编号','往来单位','状态','订单金额'],documents.filter(r=>types.includes(r.type)).map(r=>({...r,documentId:r.id})),r=>[r.date,r.number,r.partnerName,statusNames[r.status],cash(r.total)]);
   const groups=new Map();
   const costs=new Map();

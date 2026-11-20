@@ -6,11 +6,13 @@ import { DatabaseSync } from 'node:sqlite';
 import { check, log } from './engine.js';
 
 const businessTables={
+  print_jobs:'打印记录',
+  opening_manual:'期初科目余额',opening_state:'建账状态',
   attachments:'单据附件',journal_entries:'会计分录',ledger:'往来与资金流水',movements:'库存流水',
   stock:'库存余额',lots:'商品批次',serials:'序列号',statement_links:'对账链接',lines:'单据明细',
   documents:'单据（含订单和期初）',closes:'月结记录'
 };
-const documentAudit="action IN ('保存单据','submit','approve','unapprove','reject','post','settle','stop','delete','restore')";
+const documentAudit="action IN ('保存单据','submit','approve','unapprove','reject','post','settle','stop','delete','restore','reverse')";
 const masterGroups={
   products:['products'],bundles:['bundles'],partners:['partners'],carriers:['carriers'],
   prices:['supplierPrices','customerPrices','tiers']

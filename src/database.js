@@ -15,6 +15,10 @@ export function openDatabase(path) {
   db.exec(`
     PRAGMA foreign_keys=ON;
     PRAGMA busy_timeout=5000;
+    CREATE TABLE IF NOT EXISTS opening_state (
+      id INTEGER PRIMARY KEY CHECK(id=1),opened INTEGER NOT NULL,date TEXT NOT NULL,revision INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS opening_manual (account INTEGER PRIMARY KEY REFERENCES master(id),amount INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
       hash TEXT NOT NULL, role TEXT NOT NULL, department TEXT NOT NULL DEFAULT '',

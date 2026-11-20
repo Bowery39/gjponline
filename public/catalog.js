@@ -11,9 +11,9 @@ export const families = {
   miscOut:['其他出库单','QC','仓储',null,'out'], miscIn:['其他入库单','QR','仓储',null,'in'],
   issue:['内部领用单','LY','仓储',null,'out'], issueReturn:['领用退回单','LT','仓储',null,'in'],
   revalue:['成本调价单','TJ','仓储',null,'revalue'], count:['盘点单','PD','库存',null,'count'],
-  openingStock:['期初库存商品','QK','资料',null,'in'],
-  openingAR:['期初应收','QS','资料','customer','cash'], openingAP:['期初应付','QF','资料','supplier','cash'],
-  openingCash:['期初收支账户','QZ','资料',null,'cash'], openingBalance:['期初资产负债','QJ','资料',null,'journal'],
+  openingStock:['期初库存商品','QK','期初建账',null,'in'],
+  openingAR:['期初应收','QS','期初建账','customer','cash'], openingAP:['期初应付','QF','期初建账','supplier','cash'],
+  openingCash:['期初收支账户','QZ','期初建账',null,'cash'], openingBalance:['期初资产负债','QJ','期初建账',null,'journal'],
   receipt:['收款单','SK','财务','customer','cash'], payment:['付款单','FK','财务','supplier','cash'],
   expense:['费用单','FY','财务',null,'cash'], deferred:['待摊费用单','DT','财务',null,'cash'],
   income:['其他收入单','SR','财务',null,'cash'], advanceIn:['预收款单','YS','财务','customer','cash'],
@@ -43,11 +43,13 @@ export const stockEffects = ['in','out','transfer','exchange','count','revalue']
 export const relatedDocuments = {
   purchaseOrder:['inquiry'], purchase:['purchaseOrder','inquiry'], purchaseReturn:['purchase'], purchaseExchange:['purchase'],
   purchaseFee:['purchase'], salesOrder:['quote'], sale:['salesOrder','quote'], salesReturn:['sale'],
-  exchange:['sale'], salesFee:['sale'], transfer:['transferOrder'], receipt:['sale','exchange'],
-  payment:['purchase','purchaseExchange','sale']
+  exchange:['sale'], salesFee:['sale'], transfer:['transferOrder'], receipt:['sale','exchange','openingAR'],
+  payment:['purchase','purchaseExchange','sale','openingAP']
 };
 export const submittedSources = ['inquiry','quote','salesOrder','purchaseOrder','transferOrder'];
-export const settlementFooters = ['sale','salesOrder','purchaseOrder','purchase'];
+export const settlementFooters = ['sale','salesOrder','purchaseOrder','purchase','salesReturn','purchaseReturn','purchaseExchange','exchange'];
 export const logisticsFooters = [...settlementFooters,'quote','salesReturn','purchaseReturn','purchaseExchange','exchange','transferOrder','transfer'];
 
 export const orderFulfillment = {purchaseOrder:'purchase',salesOrder:'sale'};
+
+export const settlementTypes=['receipt','payment','advanceIn','advanceOut'];

@@ -1,9 +1,10 @@
+import {isOpening,openingState,assertOpeningEditable,assertBusinessOpen} from './opening-state.js';
 import { permits } from '../public/permissions.js';
 import { getSystemSettings } from './system-settings.js';
-import { documentTaxInclusive, lineAmounts, roundDecimal, unitPrice } from '../public/system-settings.js';
+import { documentTaxInclusive, lineAmounts, roundDecimal, unitPrice, tradeTypes, storedTradeTotals, costDocumentTypes } from '../public/system-settings.js';
 import { documentFields, normalizeFieldRules } from '../public/document-settings.js';
-import { families, stockEffects, relatedDocuments, settlementFooters, submittedSources, orderFulfillment } from '../public/catalog.js';
-import { productUnits } from '../public/units.js';
+import { families, stockEffects, relatedDocuments, settlementFooters, submittedSources, orderFulfillment, settlementTypes } from '../public/catalog.js';
+import { productUnits, unitDetails } from '../public/units.js';
 import { generateJournal, adjustJournalForClosing } from './accounting.js';
 
 export const parse = value => JSON.parse(value || '{}');
@@ -39,6 +40,17 @@ export function getMaster(s, id, kind, required = true) {
   check(row, '请选择有效的' + ({products:'商品', partners:'往来单位', warehouses:'仓库', accounts:'资金账户',ledgerAccounts:'会计科目'}[kind] || '资料'));
   return {...row, data:parse(row.data)};
 }
+export function inventoryCost(s,productId,warehouse,unit,batch='') {
+  const product=getMaster(s,productId,'products').data;
+  const factor=productUnits(product).get(unit||product.unit||'');
+  check(factor,'明细单位与商品的单位设置不符');
+  const stock=product.method==='individual'&&batch
+    ? s.one("SELECT SUM(quantity) quantity,SUM(value) value FROM movements WHERE product=? AND warehouse=? AND batch=?",productId,warehouse,batch)
+    : balance(s,productId,warehouse);
+  if (stock?.quantity>0) return {price:stock.value/stock.quantity*10*factor,source:'移动加权成本'};
+  const fallback=product.referenceCost!==''&&product.referenceCost!=null?product.referenceCost:product.purchase||0;
+  return {price:number(fallback)*factor,source:product.referenceCost!==''&&product.referenceCost!=null?'参考成本价':'采购成本价'};
+}
 export function lookupPrice(s, productId, partnerId, quantity, side, preset = 1) {
   const product = getMaster(s, productId, 'products').data;
   const rows = s.all('SELECT name,data FROM master WHERE active=1 AND kind IN (?,?)', side === 'supplier' ? 'supplierPrices' : 'customerPrices', 'tiers');
@@ -52,7 +64,7 @@ export function lookupPrice(s, productId, partnerId, quantity, side, preset = 1)
   return side === 'supplier' && product.purchase != null
     ? {price:number(product.purchase),source:'采购价'} : {price:number(product.retail),source:'零售价'};
 }
-function orderExecution(s,user,order) {
+export function orderExecution(s,user,order) {
   const type=orderFulfillment[order.type];
   const downstream=s.all(`SELECT id,number,date,status,warehouse,target,department,type FROM documents
     WHERE type=? AND json_extract(data,'$.reference')=? AND status IN ('posted','settled') ORDER BY date,id`,type,order.id);
@@ -77,20 +89,38 @@ export function getDocument(s, user, id, detail=false) {
     FROM documents d LEFT JOIN master p ON d.partner=p.id LEFT JOIN master w ON d.warehouse=w.id
     JOIN users u ON u.id=d.creator WHERE d.id=?`, Number(id));
   check(row && visible(user,row) && permits(user,'d:'+row.type), '单据不存在或无访问权限', 404);
-  const doc={...row,data:parse(row.data),attachments:s.all('SELECT id,name,length(content) size FROM attachments WHERE doc=? ORDER BY id',row.id),lines:s.all(`SELECT l.*, m.name productName, m.code productCode
+  const doc={...row,data:parse(row.data),attachments:s.all('SELECT id,name,length(content) size FROM attachments WHERE doc=? ORDER BY id',row.id),lines:s.all(`SELECT l.*, m.name productName, m.code productCode, json_extract(m.data,'$.barcode') productBarcode
     FROM lines l LEFT JOIN master m ON m.id=l.product WHERE l.doc=? ORDER BY l.position`,row.id)
     .map(line => ({...line,data:parse(line.data)}))};
+  doc.autoSettlements=s.all("SELECT id,number,type FROM documents WHERE json_extract(data,'$.settlementSource')=? AND status IN ('posted','settled') ORDER BY id",doc.id);
+  if (isOpening(doc.type)) doc.openingReadOnly=openingState(s)?.opened===true;
   if (Object.hasOwn(orderFulfillment,doc.type)) doc.execution=orderExecution(s,user,doc);
-  if (['purchase','purchaseExchange','sale','exchange'].includes(doc.type)) {
-    doc.unpaid=documentBalance(s,doc.id,doc.partner,['purchase','purchaseExchange'].includes(doc.type)?'ap':'ar');
+  if (['purchase','purchaseExchange','sale','exchange','openingAR','openingAP'].includes(doc.type)) {
+    doc.unpaid=documentBalance(s,doc.id,doc.partner,['purchase','purchaseExchange','openingAP'].includes(doc.type)?'ap':'ar');
   }
+  if (['purchase','sale'].includes(doc.type)&&posted.includes(doc.status)) doc.recordedSettlement=doc.total-doc.unpaid;
+  if (tradeTypes.includes(doc.type)) {
+    const postedTrade=posted.includes(doc.status);
+    const inline=(doc.data.advance||0)+(doc.data.paid||0)+(doc.data.receipts||[]).reduce((sum,row)=>sum+row.amount,0);
+    const refund=doc.type.endsWith('Return')||doc.total<0;
+    const refunded=postedTrade&&refund?s.one(`SELECT COUNT(*) count,COALESCE(SUM(total),0) amount FROM documents
+      WHERE type IN ('payment','receipt') AND status IN ('posted','settled') AND json_extract(data,'$.reference')=?`,doc.id):null;
+    const settled=postedTrade&&!refund&&doc.unpaid!=null ? doc.total-doc.unpaid : refunded?.count ? refunded.amount : inline;
+    doc.tradeAmounts={...storedTradeTotals(doc),settled,outstanding:Math.abs(doc.total)-settled};
+    if (doc.execution) doc.tradeAmounts.executed=doc.lines.reduce((sum,line,index)=>{
+      const {ordered,done}=doc.execution.rows[index];
+      return sum+(ordered?Math.round((line.net+line.tax)*done/ordered):0);
+    },0);
+  }
+  if (settlementTypes.includes(doc.type)) doc.reversedBy=s.one(
+    "SELECT id,number FROM documents WHERE json_extract(data,'$.reversalOf')=?",doc.id)||null;
   if (detail) {
     doc.relations=s.all(`SELECT d.id,d.number,d.type,d.status,d.date,d.department,d.warehouse,d.target
-      FROM documents d WHERE d.status!='deleted' AND (d.id=? OR json_extract(d.data,'$.reference')=?)
-      ORDER BY d.date,d.id`,doc.data.reference||null,doc.id)
+      FROM documents d WHERE d.status!='deleted' AND (d.id IN (?,?) OR json_extract(d.data,'$.reference')=? OR json_extract(d.data,'$.reversalOf')=?)
+      ORDER BY d.date,d.id`,doc.data.reference||null,doc.data.reversalOf||null,doc.id,doc.id)
       .filter(row=>visible(user,row)&&permits(user,'d:'+row.type)).map(({id,number,type,status,date})=>({id,number,type,status,date}));
     doc.history=s.all(`SELECT a.created date,a.action,u.name operator FROM audit a LEFT JOIN users u ON u.id=a.user_id
-      WHERE (a.action='保存单据' AND a.detail=?) OR (a.action IN ('submit','approve','unapprove','reject','post','settle','stop','delete','restore') AND a.detail=?)
+      WHERE (a.action='保存单据' AND a.detail=?) OR (a.action IN ('submit','approve','unapprove','reject','post','settle','stop','delete','restore','reverse') AND a.detail=?)
       ORDER BY a.id DESC LIMIT 100`,String(doc.id),doc.number);
     const accounts=[doc.data.account,doc.data.targetAccount,...(doc.data.receipts||[]).map(row=>row.account),
       ...(doc.data.saleExpenses||[]).flatMap(row=>[row.partner,row.subject,row.account]),doc.data.carrier];
@@ -112,14 +142,18 @@ export function saveDocument(s, user, input, {preview=false}={}) {
     if (current) check(input.revision === current.data.revision, '单据已被其他用户修改，请重新打开',409);
     const type = current?.type || input.type;
     check(Object.hasOwn(families,type),'未知单据类型');
+    if (isOpening(type)) assertOpeningEditable(s);
     check(permits(user,'d:'+type,current?'edit':'create'),'没有此单据的保存权限',403);
     const [,prefix,,partnerType,effect] = families[type];
     const date = input.date || today();
     validateDate(date);
+    const setup=openingState(s);
+    if (!isOpening(type)&&setup?.opened) check(date>=setup.date,'单据日期不能早于建账日期');
     check(!current || date === current.date, '已编号单据不能修改单据日期，请重新开单');
     openPeriod(s,date);
     let department = user.role === 'admin' ? String(input.department || '') : user.department;
     const selected = input.data ?? {};
+    if (settlementTypes.includes(type)) validateSettlementAccount(s,selected);
     const configured=s.one('SELECT fields_json FROM document_settings WHERE user_id=? AND type=?',user.id,type);
     const rules=normalizeFieldRules(type,parse(configured?.fields_json||'{}'));
     const requireConfigured=(section,values,prefix='')=>{
@@ -164,12 +198,25 @@ export function saveDocument(s, user, input, {preview=false}={}) {
     const taxEnabled=current ? current.data.taxEnabled!==false : settings.taxEnabled;
     const taxInclusive=current ? current.data.taxInclusive===true : documentTaxInclusive(settings,partnerType);
     const taxMode=current ? current.data.taxMode||'general' : settings.taxMode;
-    const discount=roundDecimal(number(selected.discount??1,0,1),precision.discountDigits);
+    const discount=type==='openingStock'?1:roundDecimal(number(selected.discount??1,0,1),precision.discountDigits);
     const data = {
       ...selected, precision, taxEnabled, taxInclusive, taxMode, reference:foreign?.id || null, discount, revision:(current?.data.revision || 0)+1,
       amount:cents(selected.amount), reduction:cents(selected.reduction), freight:cents(selected.freight),
       advance:cents(selected.advance), fee:cents(selected.fee), paid:cents(selected.paid)
     };
+    if (tradeTypes.includes(type)&&data.paid&&!data.account&&(input.amountCheck!=null||!Object.hasOwn(orderFulfillment,type))) {
+      check(settings.defaultSettlementAccount,'请选择本次收付款账户');
+      if (settings.defaultSettlementAccount) data.account=getMaster(s,settings.defaultSettlementAccount,'accounts').id;
+    }
+    if (tradeTypes.includes(type)&&selected.documentDiscount!=null)
+      data.documentDiscount=number(selected.documentDiscount,0,100);
+    if (type==='openingStock') {data.reduction=0;data.freight=0;}
+    // Reversal metadata is assigned only by the posting transaction.
+    delete data.reversalOf;
+    delete data.tradeSettlementCategory;
+    delete data.tradeBalanceReference;
+    delete data.settlementSource;
+    data.useAdvance=['receipt','payment'].includes(type)&&selected.useAdvance===true;
     if (selected.handlerId) {
       const staff=s.one('SELECT id,name FROM users WHERE id=? AND active=1',Number(selected.handlerId));
       check(staff,'请选择在职的经手人');
@@ -196,8 +243,11 @@ export function saveDocument(s, user, input, {preview=false}={}) {
       check(data.saleExpenses.every(row=>row.paid<=row.amount && (!row.paid||row.account) &&
         (row.paid===row.amount||row.partner)),'未付销售费用须指定往来单位，已付金额须指定付款账户');
     }
-    const rows = input.lines || [];
-    check(Array.isArray(rows) && rows.length <= 500,'明细最多 500 行');
+    const inputRows=input.lines||[];
+    check(Array.isArray(inputRows),'请填写有效的商品明细');
+    const trade=tradeTypes.includes(type);
+    const rows=trade?inputRows.filter(row=>row?.product!=null&&row.product!==''):inputRows;
+    check(rows.length<=500,'明细最多 500 行');
     const goods = !['cash','journal'].includes(effect);
     if (goods) check(rows.length > 0,'请填写商品明细');
     const lines = rows.map((row,i) => {
@@ -209,13 +259,14 @@ export function saveDocument(s, user, input, {preview=false}={}) {
       const unitsByProduct=goods?productUnits(product.data):null;
       const unitFactor=goods?unitsByProduct.get(unit):1;
       check(unitFactor,'明细单位与商品的单位设置不符');
-      const enteredQuantity=goods?qty(row.quantity,precision.quantityDigits):0;
-      const units=qty(enteredQuantity*unitFactor/1000,Math.max(3,precision.quantityDigits));
-      check(!goods || units > 0 || ['count','revalue','fee'].includes(effect),'数量必须大于零');
-      const price=goods?roundDecimal(number(row.price),precision.priceDigits):0;
-      const lineDiscount=roundDecimal(number(row.discount??1,0,1),precision.discountDigits);
-      const rate=taxEnabled?number(row.tax??0,0,100):0;
-      const {net,tax}=lineAmounts(enteredQuantity/1000,price,lineDiscount*discount,rate,taxInclusive);
+      const enteredQuantity=goods?(type==='openingStock'&&Number(row.quantity)<0?-qty(-Number(row.quantity),precision.quantityDigits):qty(row.quantity,precision.quantityDigits)):0;
+      const units=Math.sign(enteredQuantity)*qty(Math.abs(enteredQuantity)*unitFactor/1000,Math.max(3,precision.quantityDigits));
+      check(!goods || units > 0 || type==='openingStock' || ['count','revalue','fee'].includes(effect),'数量必须大于零');
+      const costPrice=costDocumentTypes.includes(type)?inventoryCost(s,product.id,warehouse.id,unit,row.batch):null;
+      const price=costPrice?costPrice.price:goods?roundDecimal(number(row.price),precision.priceDigits):0;
+      const lineDiscount=type==='openingStock'||costPrice?1:roundDecimal(number(row.discount??1,0,1),precision.discountDigits);
+      const rate=type!=='openingStock'&&!costPrice&&taxEnabled?number((row.tax===''?undefined:row.tax)??product?.data.taxRate??0,0,100):0;
+      const {net,tax}=lineAmounts(enteredQuantity/1000,price,costPrice?1:lineDiscount*discount,rate,costPrice?false:taxInclusive);
       let debit = 0;
       let credit = 0;
       let account = null;
@@ -227,6 +278,8 @@ export function saveDocument(s, user, input, {preview=false}={}) {
       }
       const data = {...row,unitPrice:price,unit,unitFactor,enteredQuantity,discount:lineDiscount,tax:rate,debit,credit,ledgerAccount:account,
         batch:String(row.batch || '').trim(),expiry:String(row.expiry || ''),serials:[...new Set(String(row.serials || '').split(/[，,\s]+/).filter(Boolean))]};
+      if (costPrice) data.source=costPrice.source;
+      if (trade) data.barcode=unitDetails(product.data,unit)?.barcode||product.data.barcode||'';
       return {position:i+1,product:product?.id || null,units,price:cents(price),net,tax,data};
     });
     if (effect === 'journal') {
@@ -235,9 +288,14 @@ export function saveDocument(s, user, input, {preview=false}={}) {
     if (['cash','fee'].includes(effect)) check(data.amount > 0,'金额必须大于零');
     if (type==='purchaseExchange') check(lines.some(line=>line.data.direction==='return')&&lines.some(line=>line.data.direction!=='return'),'采购换货须同时填写退回供应商和换入明细');
     const total = ['cash','fee'].includes(effect) ? data.amount : lines.reduce((sum,l) => sum + (l.data.direction === 'return' && effect === 'exchange' ? -1 : 1) * (l.net+l.tax),0) + data.freight - data.reduction;
-    check(Number.isSafeInteger(total) && (total >= 0 || effect === 'exchange'),'单据金额无效');
-    validateDocumentLimits(s,{type,total,partner:partner?.id,warehouse:warehouse?.id,
+    check(Number.isSafeInteger(total) && (total >= 0 || type==='openingStock' || effect === 'exchange'),'单据金额无效');
+    validateDocumentLimits(s,{type,total,data,partner:partner?.id,warehouse:warehouse?.id,
       lines:lines.map(line=>({...line,quantity:line.units}))},foreign);
+    if (tradeTypes.includes(type)&&input.amountCheck!=null) {
+      const totals=storedTradeTotals({type,data,lines:lines.map(line=>({...line,quantity:line.units}))});
+      check(['baseAmount','net','tax','gross'].every(key=>input.amountCheck[key]===totals[key])&&input.amountCheck.total===total,
+        '单据金额与服务器计算结果不一致，请重新核对');
+    }
     if (preview) return {valid:true};
     if (current) {
       s.run('UPDATE documents SET date=?,partner=?,warehouse=?,target=?,department=?,total=?,data=? WHERE id=?',date,partner?.id||null,warehouse?.id||null,target?.id||null,department,total,JSON.stringify(data),current.id);
@@ -271,6 +329,7 @@ export function saveDocument(s, user, input, {preview=false}={}) {
       check(attachmentBytes<=30*1024*1024,'每单附件合计最大 30 MB');
       s.run('INSERT INTO attachments(doc,name,content) VALUES (?,?,?)',id,name,content);
     }
+    if (isOpening(type)) s.run('UPDATE opening_state SET revision=revision+1 WHERE id=1');
     log(s,user,'保存单据',String(id));
     return getDocument(s,user,id);
   });
@@ -401,11 +460,36 @@ function settlementBalance(s,doc,reference) {
     s.one('SELECT COALESCE(SUM(amount),0) total FROM ledger WHERE category=? AND entity=?',category,doc.partner).total;
 }
 
+function validateSettlementAccount(s,data) {
+  if (!s.one("SELECT id FROM master WHERE kind='accounts' AND active=1 AND id=?",Number(data.account)||0))
+    throw Object.assign(new Error('请选择结算账户'),{status:400,code:'SETTLEMENT_ACCOUNT_REQUIRED',field:'account'});
+}
+
+function advanceCategory(type) {
+  return ['receipt','advanceIn'].includes(type)?'advanceIn':'advanceOut';
+}
+function advanceBalance(s,partner,category) {
+  return s.one('SELECT COALESCE(SUM(amount),0) amount FROM ledger WHERE category=? AND entity=?',category,partner).amount;
+}
+
 function validateDocumentLimits(s,doc,reference) {
   const {type,total,warehouse}=doc;
   if (['receipt','payment'].includes(type)) {
     const remaining=settlementBalance(s,doc,reference);
     checkLimit(remaining>=total,'结算金额超出未结金额（当前未结 ¥'+(remaining/100).toFixed(2)+'）');
+    if (doc.data.useAdvance) {
+      check(reference,'核销预收预付必须选择源单');
+      checkLimit(advanceBalance(s,doc.partner,advanceCategory(type))>=total,'预收或预付余额不足');
+    }
+  }
+  if (tradeTypes.includes(type)&&!Object.hasOwn(orderFulfillment,type)) {
+    const {data}=doc;
+    const collected=(data.receipts||[]).reduce((sum,row)=>sum+row.amount,0);
+    checkLimit(!data.paid||data.account,'请选择本次收付款账户');
+    checkLimit((data.advance||0)+(data.paid||0)+collected<=Math.abs(total),'结算金额不得超过本单金额');
+    const returnFlow=type.endsWith('Return')||total<0;
+    if (data.advance&&!returnFlow) checkLimit(advanceBalance(s,doc.partner,families[type][3]==='supplier'?'advanceOut':'advanceIn')>=data.advance,
+      '预收或预付余额不足');
   }
   if (['purchaseReturn','purchaseExchange','salesReturn','exchange'].includes(type)) validateLinkedQuantities(s,doc,reference);
   const effect=families[type][4];
@@ -431,6 +515,27 @@ function validateDocumentLimits(s,doc,reference) {
   }
 }
 
+function postTradeSettlement(s,user,doc,{account=null,amount,refund,advance=false,reference}) {
+  const purchase=families[doc.type][3]==='supplier';
+  const receiving=purchase===refund;
+  const type=receiving?'receipt':'payment';
+  const prefix=families[type][1];
+  const sequence=s.one(`INSERT INTO sequences(prefix,date,value) VALUES (?,?,1)
+    ON CONFLICT(prefix,date) DO UPDATE SET value=value+1 RETURNING value`,prefix,doc.date).value;
+  check(sequence<=99999,'当日编号已用完');
+  const number=prefix+'-'+doc.date.replaceAll('-','')+'-'+String(sequence).padStart(5,'0');
+  const category=purchase?'ap':'ar';
+  const data={account,amount,useAdvance:advance,reference:doc.id,tradeSettlementCategory:category,tradeBalanceReference:reference,settlementSource:doc.id,summary:'随单结算 '+doc.number,revision:1};
+  const id=s.run(`INSERT INTO documents(number,type,date,status,partner,warehouse,department,creator,total,data)
+    VALUES (?,?,?,'posted',?,?,?,?,?,?)`,number,type,doc.date,doc.partner,doc.warehouse,doc.department,user.id,amount,JSON.stringify(data)).lastInsertRowid;
+  const settlement={id,type,date:doc.date};
+  ledger(s,settlement,category,doc.partner,(refund?1:-1)*amount,reference);
+  if (advance) ledger(s,settlement,purchase?'advanceOut':'advanceIn',doc.partner,(refund?1:-1)*amount,doc.id);
+  else ledger(s,settlement,'cash',getMaster(s,account,'accounts').id,(receiving?1:-1)*amount);
+  generateJournal(s,settlement);
+  log(s,user,'post',number);
+}
+
 function post(s,user,doc) {
   openPeriod(s,doc.date);
   const [, , , ,effect] = families[doc.type];
@@ -444,38 +549,60 @@ function post(s,user,doc) {
   if (reference&&orderFulfillment[reference.type]===type) {
     check(reference.execution.state!=='closed','关联订单已终止');
   }
+  if (settlementTypes.includes(type)) {
+    validateSettlementAccount(s,data);
+  }
+  if (settlementTypes.includes(type)||tradeTypes.includes(type)) validateDocumentLimits(s,doc,reference);
   validateLinkedQuantities(s,doc,reference);
+  if (costDocumentTypes.includes(type)) for (const line of doc.lines) {
+    const quote=inventoryCost(s,line.product,doc.warehouse,line.data.unit,line.data.batch);
+    line.data.unitPrice=quote.price;
+    line.data.source=quote.source;
+    line.data.tax=0;
+    line.data.discount=1;
+    line.price=Math.round(quote.price*100);
+    line.net=Math.round((line.data.enteredQuantity??line.quantity)/1000*quote.price*100);
+    line.tax=0;
+  }
   const cost = stockEffects.includes(effect) ? stockPosting(s,doc,effect,reference) : 0;
+  if (costDocumentTypes.includes(type)) {
+    for (const line of doc.lines) {
+      const movement=s.one('SELECT SUM(value) amount FROM movements WHERE doc=? AND position=? AND warehouse=?',
+        doc.id,line.position,doc.warehouse);
+      line.net=Math.abs(movement?.amount||0);
+      const entered=(line.data.enteredQuantity??line.quantity)/1000;
+      line.data.unitPrice=entered?line.net/100/entered:0;
+      s.run('UPDATE lines SET price=?,net=?,tax=0,data=? WHERE doc=? AND position=?',
+        Math.round(line.data.unitPrice*100),line.net,JSON.stringify(line.data),doc.id,line.position);
+    }
+    doc.total=doc.lines.reduce((sum,line)=>sum+line.net,0)+(data.freight||0)-(data.reduction||0);
+    s.run('UPDATE documents SET total=? WHERE id=?',doc.total,doc.id);
+  }
   const entry = (category,entity,amount,ref) => ledger(s,doc,category,entity,amount,ref);
   const cash = (id,amount) => { if (amount) entry('cash',getMaster(s,id,'accounts').id,amount); };
   if (['purchase','purchaseReturn','purchaseExchange'].includes(type)) {
     const payable=type==='purchaseReturn'?-total:total;
     entry('ap',partner,payable,type==='purchase'||type==='purchaseExchange'&&payable>0?doc.id:reference?.id||null);
   }
-  if (['sale','salesReturn','exchange','purchase'].includes(type)) {
-    const sale = type !== 'purchase';
-    const key = sale ? 'ar' : 'ap';
-    const advanceKey = sale ? 'advanceIn' : 'advanceOut';
-    if (sale) {
-      const amount = type === 'salesReturn' ? -total : total;
-      const tax = doc.lines.reduce((sum,line) => sum + (type === 'salesReturn' || (type === 'exchange' && line.data.direction === 'return') ? -1 : 1)*line.tax,0);
-      entry(key,partner,amount,type==='sale' || (type==='exchange' && amount>0) ? doc.id : reference?.id || null);
-      entry('sales',partner,amount-tax);
-      entry('tax',partner,tax);
-      entry('cogs',null,cost);
-    }
+  if (['sale','salesReturn','exchange'].includes(type)) {
+    const amount = type === 'salesReturn' ? -total : total;
+    const tax = doc.lines.reduce((sum,line) => sum + (type === 'salesReturn' || (type === 'exchange' && line.data.direction === 'return') ? -1 : 1)*line.tax,0);
+    entry('ar',partner,amount,type==='sale'||type==='exchange'&&amount>0 ? doc.id : reference?.id||null);
+    entry('sales',partner,amount-tax);
+    entry('tax',partner,tax);
+    entry('cogs',null,cost);
+  }
+  if (tradeTypes.includes(type)&&!Object.hasOwn(orderFulfillment,type)) {
+    const refund=type.endsWith('Return')||total<0;
+    const balanceRef=refund?reference?.id||null:doc.id;
     const receipts=data.receipts||[];
-    const collected=receipts.reduce((sum,row)=>sum+row.amount,0);
-    if (data.advance || data.paid || collected) {
-      check(['sale','purchase'].includes(type) && data.advance+data.paid+collected<=total,'结算金额不得超过本单金额');
-      if (data.advance) {
-        const balance = s.one('SELECT COALESCE(SUM(amount),0) amount FROM ledger WHERE category=? AND entity=?',advanceKey,partner).amount;
-        check(balance >= data.advance,'预收或预付余额不足');
-        entry(advanceKey,partner,-data.advance);
-      }
-      cash(data.account,(sale ? 1 : -1)*data.paid);
-      for (const item of receipts) cash(item.account,(sale?1:-1)*item.amount);
-      entry(key,partner,-(data.advance+data.paid+collected),doc.id);
+    if (data.paid) postTradeSettlement(s,user,doc,{account:data.account,amount:data.paid,refund,reference:balanceRef});
+    for (const item of receipts) postTradeSettlement(s,user,doc,{...item,refund,reference:balanceRef});
+    if (data.advance) postTradeSettlement(s,user,doc,{amount:data.advance,refund,advance:true,reference:balanceRef});
+    if (data.reduction) {
+      const subject=s.one("SELECT id FROM master WHERE kind='expenses' AND name='优惠' ORDER BY id LIMIT 1");
+      const id=subject?.id??Number(s.run("INSERT INTO master(kind,code,name,data) VALUES ('expenses',?,'优惠','{}')",'TRADE-DISCOUNT-'+doc.id).lastInsertRowid);
+      entry('discount',id,data.reduction,doc.id);
     }
   }
   if (['sale','purchase'].includes(type)) for (const row of data.saleExpenses||[]) {
@@ -488,7 +615,11 @@ function post(s,user,doc) {
     const category = receiving ? 'ar' : 'ap';
     check(settlementBalance(s,doc,reference)>=total,'结算金额超出未结金额');
     entry(category,partner,-total,reference?.id || null);
-    cash(data.account,receiving ? total : -total);
+    if (data.useAdvance) {
+      entry(advanceCategory(type),partner,-total,reference.id);
+      if (documentBalance(s,reference.id,partner,category)===0)
+        s.run("UPDATE documents SET status='settled' WHERE id=? AND partner=? AND type IN ('sale','purchase','exchange','purchaseExchange','openingAR','openingAP')",reference.id,partner);
+    } else cash(data.account,receiving ? total : -total);
   }
   if (type === 'advanceIn' || type === 'advanceOut') {
     entry(type,partner,total);
@@ -543,13 +674,125 @@ export function transitionDocuments(s,user,ids,action) {
   return s.tx(()=>ids.map(id=>changeDocumentStatus(s,user,id,action)));
 }
 
+function reverseSettlement(s,user,doc) {
+  check(settlementTypes.includes(doc.type)&&posted.includes(doc.status)&&!doc.data.reversalOf,'仅已记账的原始收付款或预收预付单可红冲',409);
+  check(!doc.reversedBy,'本单已红冲',409);
+  const date=today();
+  openPeriod(s,date);
+  if (['advanceIn','advanceOut'].includes(doc.type)) {
+    checkLimit(advanceBalance(s,doc.partner,advanceCategory(doc.type))>=doc.total,'预收或预付余额已核销，请先红冲核销单');
+  }
+  if (doc.data.tradeSettlementCategory&&doc.data.useAdvance) {
+    const category=doc.data.tradeSettlementCategory==='ap'?'advanceOut':'advanceIn';
+    const credit=s.one('SELECT amount FROM ledger WHERE doc=? AND category=?',doc.id,category)?.amount||0;
+    if (credit>0) checkLimit(advanceBalance(s,doc.partner,category)>=credit,'退款已用于核销，请先红冲核销单');
+  }
+  const prefix='HC';
+  const sequence=s.one(`INSERT INTO sequences(prefix,date,value) VALUES (?,?,1)
+    ON CONFLICT(prefix,date) DO UPDATE SET value=value+1 RETURNING value`,prefix,date).value;
+  check(sequence<=99999,'当日编号已用完');
+  const number=prefix+'-'+date.replaceAll('-','')+'-'+String(sequence).padStart(5,'0');
+  const data={...doc.data,summary:'红冲 '+doc.number,reversalOf:doc.id,amount:-doc.total,revision:1};
+  const id=s.run(`INSERT INTO documents(number,type,date,status,partner,warehouse,target,department,creator,total,data)
+    VALUES (?,?,?,'posted',?,?,?,?,?,?,?)`,number,doc.type,date,doc.partner,doc.warehouse,doc.target,doc.department,user.id,-doc.total,JSON.stringify(data)).lastInsertRowid;
+  s.run('INSERT INTO ledger(doc,date,category,entity,amount,reference) SELECT ?,?,category,entity,-amount,reference FROM ledger WHERE doc=?',id,date,doc.id);
+  s.run(`INSERT INTO journal_entries(doc,date,code,name,category,entity,amount)
+    SELECT ?,?,code,name,category,entity,-amount FROM journal_entries WHERE doc=?`,id,date,doc.id);
+  if (doc.data.reference&&['receipt','payment'].includes(doc.type)) {
+    const category=doc.data.tradeSettlementCategory||(doc.type==='receipt'?'ar':'ap');
+    const reference=doc.data.tradeBalanceReference??doc.data.reference;
+    if (documentBalance(s,reference,doc.partner,category)!==0)
+      s.run("UPDATE documents SET status='posted' WHERE id=? AND status='settled'",reference);
+  }
+  log(s,user,'reverse',doc.number);
+  log(s,user,'post',number);
+  return getDocument(s,user,id);
+}
+
+function unapproveTradeSettlement(s,user,doc) {
+  check(['purchase','sale'].includes(doc.type)&&doc.autoSettlements.length,'当前状态无法反审核',409);
+  const childIds=doc.autoSettlements.map(row=>row.id);
+  const dependents=s.all("SELECT id,number,data FROM documents WHERE status!='deleted' AND json_extract(data,'$.reference')=?",doc.id);
+  check(dependents.every(row=>childIds.includes(row.id)),'存在独立收付款或后续单据，不能反审核，请先处理关联单据',409);
+  const movements=s.all('SELECT * FROM movements WHERE doc=? ORDER BY id',doc.id);
+  for (const row of movements) {
+    check(!s.one('SELECT id FROM movements WHERE product=? AND warehouse=? AND doc<>? AND id>? LIMIT 1',
+      row.product,row.warehouse,doc.id,row.id),'存在后续库存流水，不能反审核，请先处理后续单据',409);
+  }
+  const stocks=new Map(),lots=new Map();
+  for (const row of movements) {
+    const key=row.product+'|'+row.warehouse;
+    if (!stocks.has(key)) stocks.set(key,{product:row.product,warehouse:row.warehouse,quantity:0,value:0});
+    const stock=stocks.get(key);
+    stock.quantity+=row.quantity;stock.value+=row.value;
+    if (row.batch) {
+      const lotKey=key+'|'+row.batch;
+      if (!lots.has(lotKey)) lots.set(lotKey,{...row,quantity:0});
+      lots.get(lotKey).quantity+=row.quantity;
+    }
+    for (const serial of parse(row.serials)) {
+      if (row.quantity>0) {
+        check(s.one('SELECT serial FROM serials WHERE product=? AND serial=? AND warehouse=?',row.product,serial,row.warehouse),
+          '序列号状态已变化，不能反审核',409);
+        s.run('DELETE FROM serials WHERE product=? AND serial=?',row.product,serial);
+      } else {
+        check(!s.one('SELECT serial FROM serials WHERE product=? AND serial=?',row.product,serial),'序列号已被使用，不能反审核',409);
+        s.run('INSERT INTO serials VALUES(?,?,?,?)',row.product,serial,row.warehouse,row.batch);
+      }
+    }
+  }
+  for (const row of stocks.values()) {
+    const current=balance(s,row.product,row.warehouse);
+    const quantity=scaledQuantity(current.quantity-row.quantity),value=current.value-row.value;
+    check(quantity>=0&&value>=0,'撤销后库存数量或金额无效',409);
+    s.run('UPDATE stock SET quantity=?,value=? WHERE product=? AND warehouse=?',quantity,value,row.product,row.warehouse);
+  }
+  for (const row of lots.values()) {
+    const current=s.one('SELECT quantity FROM lots WHERE product=? AND warehouse=? AND batch=?',row.product,row.warehouse,row.batch)?.quantity||0;
+    const quantity=scaledQuantity(current-row.quantity);
+    check(quantity>=0,'撤销后批次库存不足',409);
+    s.run("INSERT INTO lots VALUES(?,?,?,?,?) ON CONFLICT(product,warehouse,batch) DO UPDATE SET quantity=excluded.quantity",
+      row.product,row.warehouse,row.batch,row.expiry||'',quantity);
+  }
+  const reversals=s.all("SELECT id FROM documents WHERE status!='deleted' AND json_extract(data,'$.reversalOf') IN ("+childIds.map(()=>'?').join(',')+")",...childIds);
+  const allChildren=[...childIds,...reversals.map(row=>row.id)];
+  for (const id of [doc.id,...allChildren]) {
+    s.run('DELETE FROM journal_entries WHERE doc=?',id);
+    s.run('DELETE FROM ledger WHERE doc=?',id);
+  }
+  s.run('DELETE FROM movements WHERE doc=?',doc.id);
+  for (const id of allChildren) s.run("UPDATE documents SET status='deleted' WHERE id=?",id);
+  s.run("UPDATE documents SET status='draft',data=json_set(data,'$.revision',COALESCE(json_extract(data,'$.revision'),0)+1) WHERE id=?",doc.id);
+  log(s,user,'unapprove',doc.number);
+  for (const child of doc.autoSettlements) log(s,user,'随原单撤销结算',child.number+' ← '+doc.number);
+  return getDocument(s,user,doc.id);
+}
+
 function changeDocumentStatus(s,user,id,action) {
   const doc = getDocument(s,user,id);
+  if (isOpening(doc.type)) assertOpeningEditable(s);
+  else if (['submit','approve','post','settle'].includes(action)) {
+    assertBusinessOpen(s);
+    const setup=openingState(s);
+    if (setup) check(doc.date>=setup.date,'单据日期不能早于建账日期');
+  }
   check(permits(user,'d:'+doc.type,action),'没有此操作权限',403);
+  if (doc.data.settlementSource&&['delete','unapprove','restore'].includes(action))
+    check(false,'随单结算单据不能单独删除或反审核，请通过原单处理',409);
+  if (action==='reverse') return reverseSettlement(s,user,doc);
+  if (action==='unapprove'&&posted.includes(doc.status)&&settlementTypes.includes(doc.type))
+    check(false,'已记账单据不能反审核，请使用红冲',409);
+  if (doc.data.reversalOf||doc.reversedBy) check(false,'红冲单或已红冲单据不可再次操作',409);
   if (['delete','restore','submit','approve','unapprove','reject','stop'].includes(action)) openPeriod(s,doc.date);
+  if (action==='unapprove'&&posted.includes(doc.status)&&['purchase','sale'].includes(doc.type)) {
+    return unapproveTradeSettlement(s,user,doc);
+  }
   const next = transitions[doc.status]?.[action];
   check(typeof next === 'string','当前状态无法执行该操作',409);
-  if (action==='approve') validateDocumentLimits(s,doc,doc.data.reference?getDocument(s,user,doc.data.reference):null);
+  if (['submit','approve'].includes(action)) {
+    if (settlementTypes.includes(doc.type)) validateSettlementAccount(s,doc.data);
+    validateDocumentLimits(s,doc,doc.data.reference?getDocument(s,user,doc.data.reference):null);
+  }
   if (action === 'post') {
     post(s,user,doc);
     generateJournal(s,doc);
@@ -558,10 +801,12 @@ function changeDocumentStatus(s,user,id,action) {
     check(s.one('SELECT COALESCE(SUM(amount),0) total FROM ledger WHERE reference=? AND category IN (\'ar\',\'ap\')',doc.id).total === 0,'本单还有未结金额');
   }
   s.run('UPDATE documents SET status=? WHERE id=?',next,doc.id);
+  if (isOpening(doc.type)) s.run('UPDATE opening_state SET revision=revision+1 WHERE id=1');
   log(s,user,action,doc.number);
   return getDocument(s,user,id);
 }
 export function closeMonth(s,user,month) {
+  assertBusinessOpen(s);
   check(user.role==='admin','只有管理员可以月结',403);
   check(getSystemSettings(s).manualClose,'请先在系统配置中启用手工月结存');
   check(/^\d{4}-(0[1-9]|1[0-2])$/.test(month) && month < today().slice(0,7),'只能月结已结束的月份');

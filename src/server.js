@@ -1,3 +1,9 @@
+import {initializePrintTemplates,listPrintTemplates,getPrintTemplate,savePrintTemplate,changePrintTemplate,savePrintAsset,exportPrintTemplate,importPrintTemplate,preparePrint,recordPrint} from './print-templates.js';
+import {paginatePrint,printFields,evaluatePrintExpression} from '../public/print-layout.js';
+import {repairOpeningEquity} from './accounting.js';
+import {initializeOpening,openingState,isOpening,assertOpeningEditable} from './opening-state.js';
+import {openingData,saveOpening,changeOpening,migrateOpening} from './opening.js';
+import { tradeTypes, tradeColumns, tradeLineRow, tradeTotalRow, tradeSettlementRows, costDocumentTypes } from '../public/system-settings.js';
 import { dataMaintenance } from './data-maintenance.js';
 import { pipeline } from 'node:stream/promises';
 import { readWorkbookRows } from './xlsx-import.js';
@@ -11,7 +17,7 @@ import { createReadStream, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDatabase, seed, validPassword, passwordHash } from './database.js';
-import { check, closeMonth, getDocument, getMaster, log, lookupPrice, number, parse, saveDocument, today, transition, transitionDocuments } from './engine.js';
+import { check, closeMonth, getDocument, getMaster, log, inventoryCost, lookupPrice, number, parse, saveDocument, today, transition, transitionDocuments } from './engine.js';
 import { categoryPaths, changeCategory } from './categories.js';
 import { csvRows } from '../public/csv.js';
 import { listDocuments, report, scope } from './reports.js';
@@ -20,6 +26,11 @@ import { families, masters, statusNames, relatedDocuments, submittedSources, ord
 const digest = token => createHash('sha256').update(token).digest('hex');
 const lifetime = 12*60*60*1000;
 const files = {
+  '/print-output.js':['print-output.js','text/javascript; charset=utf-8'],
+  '/print-layout.js':['print-layout.js','text/javascript; charset=utf-8'],
+  '/print-qr.js':['print-qr.js','text/javascript; charset=utf-8'],
+  '/print-designer.js':['print-designer.js','text/javascript; charset=utf-8'],
+  '/opening.js':['opening.js','text/javascript; charset=utf-8'],
   '/':['index.html','text/html; charset=utf-8'],
   '/app.js':['app.js','text/javascript; charset=utf-8'],
   '/csv.js':['csv.js','text/javascript; charset=utf-8'],
@@ -39,10 +50,11 @@ const masterMap = row => ({...row,data:parse(row.data)});
 const userView = row => ({id:row.id,username:row.username,name:row.name,role:row.role,department:row.department,warehouses:JSON.parse(row.warehouses),active:row.active,permissions:typeof row.permissions==='string'?parse(row.permissions):row.permissions||{}});
 const roles = ['admin','clerk','reviewer','viewer'];
 const htmlEscape = value => String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-function statementHtml({partner,from,to,columns,rows,created}) {
-  const head=columns.map(c=>'<th>'+htmlEscape(c)+'</th>').join('');
-  const body=rows.map(row=>'<tr>'+row.map(c=>'<td>'+htmlEscape(c)+'</td>').join('')+'</tr>').join('');
-  return '<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>往来单位对账单</title><link rel="stylesheet" href="/style.css"><main class="content"><section class="card"><div class="section-head"><h1>往来单位对账单</h1></div><div class="toolbar">'+htmlEscape(partner)+'　'+htmlEscape(from||'期初')+' 至 '+htmlEscape(to||created)+'　　生成日期 '+htmlEscape(created)+'</div><div class="scroll-table"><table><thead><tr>'+head+'</tr></thead><tbody>'+body+'</tbody></table></div></section></main></html>';
+function statementHtml({partner,from,to,columns,rows,summary,created}) {
+  const grid=({columns,rows})=>'<div class="scroll-table"><table><thead><tr>'+
+    columns.map(c=>'<th>'+htmlEscape(c)+'</th>').join('')+'</tr></thead><tbody>'+
+    rows.map(row=>'<tr>'+row.map(c=>'<td>'+htmlEscape(c)+'</td>').join('')+'</tr>').join('')+'</tbody></table></div>';
+  return '<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>往来单位对账单</title><link rel="stylesheet" href="/style.css"><main class="content"><section class="card"><div class="section-head"><h1>往来单位对账单</h1></div><div class="toolbar">'+htmlEscape(partner)+'　'+htmlEscape(from||'期初')+' 至 '+htmlEscape(to||created)+'　　生成日期 '+htmlEscape(created)+'</div>'+(summary?grid(summary):'')+grid({columns,rows})+'</section></main></html>';
 }
 function getUsers(s) {
   return s.all('SELECT id,username,name,role,department,warehouses,active FROM users ORDER BY id').map(userView);
@@ -86,6 +98,7 @@ function saveMaster(s,actor,kind,input) {
   const existing = input.id ? s.one('SELECT * FROM master WHERE id=? AND kind=?',Number(input.id),kind) : null;
   check(!input.id || existing,'资料不存在',404);
   if (kind==='products') {
+    data.taxRate=number(data.taxRate??0,0,100);
     for (const field of ['retail','purchase','minimum','referenceCost',...Array.from({length:10},(_,i)=>'preset'+(i+1))]) {
       if (data[field]!=='' && data[field]!=null) data[field]=number(data[field]);
     }
@@ -165,9 +178,18 @@ function saveMaster(s,actor,kind,input) {
       return {product,quantity:number(c.quantity,0.001,1e6)};
     });
   }
+  if (kind==='ledgerAccounts'&&existing) {
+    const prior=parse(existing.data);
+    if (openingState(s)?.opened&&s.one("SELECT id FROM ledger WHERE entity=? AND category='journal' LIMIT 1",existing.id))
+      check(data.category===prior.category&&code===existing.code,'已开账的期初科目分类和编码不能修改',409);
+  }
   const active=input.active===0?0:1;
   if (existing) s.run('UPDATE master SET code=?,name=?,active=?,data=? WHERE id=?',code,name,active,JSON.stringify(data),existing.id);
   else s.run('INSERT INTO master(kind,code,name,active,data) VALUES (?,?,?,?,?)',kind,code,name,active,JSON.stringify(data));
+  if (kind==='partners'&&input.openingBalances) {
+    const id=existing?.id||s.one("SELECT id FROM master WHERE kind='partners' AND code=?",code).id;
+    saveOpening(s,actor,'partners',{revision:input.openingRevision,rows:[{id,...input.openingBalances}]},{withinTransaction:true});
+  }
   log(s,actor,'保存资料',masters[kind][0]+' '+code);
 }
 const productColumns={商品编号:'code',商品名称:'name',分类:'category',单位:'unit',零售价:'retail',采购价:'purchase',条码:'barcode',商家编码:'sku',属性:'attributes',成本算法:'method',预设售价1:'preset1'};
@@ -353,6 +375,12 @@ function queryMasters(s,user,kind,q) {
       }
     }
   }
+  if (kind==='accounts'&&rows.length&&(q.all!=='1'||q.export)) {
+    const balances=new Map(s.all("SELECT entity,SUM(amount) balance FROM ledger WHERE category='cash' AND date<=? GROUP BY entity",today())
+      .map(row=>[row.entity,row.balance]));
+    const initial=new Map(s.all("SELECT entity,SUM(amount) amount FROM ledger l JOIN documents d ON d.id=l.doc WHERE d.type LIKE 'opening%' AND category='cash' GROUP BY entity").map(row=>[row.entity,row.amount]));
+    for (const row of rows) {row.balance=balances.get(row.id)||0;row.openingBalance=initial.get(row.id)||0;}
+  }
   if (kind==='partners'&&rows.length&&(q.all!=='1'||q.export)) {
     const access=scope(user);
     const balances=s.all(`SELECT l.entity,l.category,SUM(l.amount) amount FROM ledger l
@@ -400,7 +428,7 @@ function seedDocumentChoices(s,includeDocuments) {
     s.run(`UPDATE users SET department='运营部' WHERE username='admin' AND department=''
       AND NOT EXISTS(SELECT 1 FROM users WHERE department!='')`);
   });
-  if (!includeDocuments || s.one('SELECT month FROM closes WHERE month>=?',today().slice(0,7))) return;
+  if (openingState(s)?.opened===false || !includeDocuments || s.one('SELECT month FROM closes WHERE month>=?',today().slice(0,7))) return;
   const actor=s.one("SELECT * FROM users WHERE username='admin' AND active=1 AND role='admin'");
   const item=code=>s.one('SELECT id FROM master WHERE code=? AND active=1',code)?.id;
   const product=item('P-1001');
@@ -426,6 +454,10 @@ export function createApp({path=':memory:', password, demo=false, demoDocuments=
     if (demo && demoDocuments) demoTransactions(s);
   }
   if (demo&&!s.one("SELECT id FROM audit WHERE action='重建数据' LIMIT 1")) seedDocumentChoices(s,demoDocuments);
+  migrateOpening(s);
+  repairOpeningEquity(s);
+  initializeOpening(s,today());
+  initializePrintTemplates(s);
   const maintenance=dataMaintenance(s,path,backupDirectory);
   const attempts=new Map();
   const server=createServer(async(req,res)=>{
@@ -436,6 +468,8 @@ export function createApp({path=':memory:', password, demo=false, demoDocuments=
         check(s.one('SELECT 1 FROM sessions WHERE token=? AND expires>?',authenticatedToken,Date.now()),'请先登录',401);
       return input;
     };
+    const sendError=(status,message,code='REQUEST_FAILED',field=null,extra={})=>
+      send({error:message,code,message,field,...extra},status);
     const send=(data,status=200)=>{
       res.writeHead(status,{'Content-Type':'application/json; charset=utf-8'});
       res.end(JSON.stringify(data));
@@ -537,9 +571,120 @@ export function createApp({path=':memory:', password, demo=false, demoDocuments=
           return send(maintenance.preview((await body(req)).groups));
         if (route==='/api/data-maintenance/rebuild'&&method==='POST') {
           const result=maintenance.rebuild(user,await body(req));
+          initializeOpening(s,today());
           res.setHeader('Set-Cookie','erp_session='+cookieOptions+'; Max-Age=0');
           return send(result);
         }
+      }
+      if (route==='/api/print-templates'&&method==='GET') return send({rows:listPrintTemplates(s,user,q.type)});
+      if (route==='/api/print-templates'&&method==='POST') return send(savePrintTemplate(s,user,await body(req,3_000_000)));
+      if (route==='/api/print-templates/import'&&method==='POST') return send(importPrintTemplate(s,user,await body(req,12_000_000)));
+      if (route==='/api/print-assets'&&method==='POST') return send(savePrintAsset(s,user,await body(req,1_500_000)));
+      const printAsset=route.match(/^\/api\/print-assets\/([a-f0-9]{64})$/);
+      if (printAsset&&method==='GET') {
+        check(permits(user,'m:templates','design')||documentTypesFor(user,'print').length,'没有打印图片权限',403);
+        const asset=s.one('SELECT * FROM print_assets WHERE id=?',printAsset[1]);
+        check(asset,'打印图片不存在',404);
+        res.writeHead(200,{'Content-Type':asset.mime,'Content-Length':asset.content.length});
+        return res.end(Buffer.from(asset.content));
+      }
+      const templateExport=route.match(/^\/api\/print-templates\/(\d+)\/export$/);
+      if(templateExport&&method==='GET') {
+        const output=JSON.stringify(exportPrintTemplate(s,user,templateExport[1]),null,2);
+        res.writeHead(200,{'Content-Type':'application/json; charset=utf-8','Content-Disposition':'attachment; filename="print-template.json"'});
+        return res.end(output);
+      }
+      const templateRoute=route.match(/^\/api\/print-templates\/(\d+)$/);
+      if(templateRoute&&method==='GET') return send(getPrintTemplate(s,user,templateRoute[1]));
+      if(templateRoute&&method==='POST') return send(changePrintTemplate(s,user,templateRoute[1],await body(req)));
+      if(route==='/api/print/preview'&&method==='POST') return send({documents:preparePrint(s,user,await body(req),{enforce:false})});
+      if(route==='/api/print/commit'&&method==='POST') return send(recordPrint(s,user,await body(req)));
+      if(route==='/api/print/excel'&&method==='POST') {
+        const values=preparePrint(s,user,await body(req));
+        const output=[];
+        let columns=[];
+        for(const {data,template} of values) {
+          check(permits(user,'d:'+data.type,'export'),'没有单据导出权限',403);
+          const shown=template.layout.table.columns.filter(column=>column.visible!==false);
+          if(!columns.length)columns=shown.map(column=>column.title);
+          output.push([data.fields.documentName,data.fields.number]);
+          if(output.length>1)output.push(shown.map(column=>column.title));
+          for(const page of paginatePrint(template,data)) {
+            output.push(...page.rows.map(row=>shown.map(column=>row[column.key]??'')));
+            if(template.layout.table.subtotal)output.push(shown.map((column,index)=>index? page.subtotal[column.key]??'':'本页小计'));
+            if(page.last&&template.layout.table.total)output.push(shown.map((column,index)=>index?page.totals[column.key]??'':'合计'));
+          }
+          const fields=paginatePrint(template,data)[0].fields;
+          output.push(...Object.entries(printFields).filter(([key])=>key!=='page').map(([key,title])=>[title,fields[key]??'']));
+          for(const element of template.layout.elements.filter(element=>element.kind==='expression'))
+            output.push([element.expression,evaluatePrintExpression(element.expression,fields)]);
+          output.push([]);
+        }
+        return sendExcel(columns,output);
+      }
+      if (route.startsWith('/api/opening')) {
+        if (route==='/api/opening/state'&&method==='GET') return send(openingState(s));
+        check(user.role==='admin','只有管理员可以维护期初建账',403);
+        if (route==='/api/opening/control'&&method==='POST') return send(changeOpening(s,user,await body(req)));
+        const openingRoute=route.match(/^\/api\/opening\/(stock|partners|accounts|balance)$/);
+        if (openingRoute&&method==='GET') return send(openingData(s,user,openingRoute[1],q.warehouse));
+        if (openingRoute&&method==='POST') return send(saveOpening(s,user,openingRoute[1],await body(req,5_000_000)));
+        if (route==='/api/opening/template'&&method==='GET') return sendExcel(q.kind==='partners'?
+          ['单位编号','期初应收','期初应付','期初预收','期初预付']:['商品编号','仓库','数量','成本单价','批号','生产日期'],[]);
+        if (route==='/api/opening/import'&&method==='POST') {
+          assertOpeningEditable(s);
+          const input=await body(req,8_000_000);
+          check(['stock','partners'].includes(input.kind),'请选择有效的期初导入类型');
+          const rows=readWorkbookRows(Buffer.from(input.workbook||'','base64'),10001);
+          check(rows.length>1,'Excel 中没有可导入数据');
+          const expected=input.kind==='stock'?['商品编号','仓库','数量','成本单价']:['单位编号','期初应收','期初应付','期初预收','期初预付'];
+          check(expected.every((label,index)=>String(rows[0][index]||'').trim()===label),'Excel 表头不正确，请下载期初模板填写');
+          const errors=[],groups=new Map(),seen=new Set();
+          for (const [index,cells] of rows.slice(1).entries()) {
+            if (cells.every(value=>String(value).trim()==='')) continue;
+            try {
+              const record=s.one('SELECT id FROM master WHERE kind=? AND code=?',input.kind==='stock'?'products':'partners',String(cells[0]).trim());
+              check(record,'编号不存在');
+              let warehouse;
+              if (input.kind==='stock') {
+                const matches=s.all("SELECT id FROM master WHERE kind='warehouses' AND (code=? OR name=?)",String(cells[1]).trim(),String(cells[1]).trim());
+                check(matches.length===1,'仓库不存在或名称重复');
+                warehouse=matches[0].id;
+              }
+              if (input.kind==='stock') {
+                const product=parse(s.one('SELECT data FROM master WHERE id=?',record.id).data);
+                check(!(product.batch||product.method==='individual')||!Number(cells[2])||String(cells[4]||'').trim(),'批次商品请填写批号');
+                check(!product.serial||!Number(cells[2]),'序列号商品请使用期初录入单');
+                check(!cells[5]||/^\d{4}-\d{2}-\d{2}$/.test(String(cells[5]))&&!isNaN(Date.parse(cells[5])),'生产日期无效');
+              }
+              const key=(warehouse||'partners')+'|'+record.id;
+              check(!seen.has(key),'重复编号或仓库商品组合');
+              seen.add(key);
+              const values=input.kind==='stock'?{id:record.id,quantity:cells[2],price:cells[3],batch:cells[4],production:cells[5]}:
+                {id:record.id,ar:cells[1],ap:cells[2],advanceIn:cells[3],advanceOut:cells[4]};
+              for (const key of input.kind==='stock'?['quantity','price']:['ar','ap','advanceIn','advanceOut']) {
+                if (input.kind==='partners'&&(values[key]===''||values[key]==null)) values[key]=0;
+                check(values[key]!==''&&values[key]!=null&&Number.isFinite(Number(values[key]))&&Number(values[key])>=0,'数量或金额必须为非负数');
+              }
+              check(input.kind!=='partners'||!(Number(values.ar)&&Number(values.ap))&&!(Number(values.advanceIn)&&Number(values.advanceOut)),'应收应付或预收预付不能同时填写');
+              const group=warehouse||'partners';
+              if (!groups.has(group)) groups.set(group,[]);
+              groups.get(group).push({...values,excelRow:index+2});
+            } catch (error) {errors.push('第 '+(index+2)+' 行：'+error.message);}
+          }
+          check(!errors.length,errors.join('；'));
+          // An enclosing transaction makes imports spanning warehouses all-or-nothing.
+          s.db.exec('BEGIN IMMEDIATE');
+          try {
+            check(input.revision===openingState(s).revision,'期初数据已变更，请刷新后重试',409);
+            for (const [warehouse,values] of groups) {
+              saveOpening(s,user,input.kind,{revision:openingState(s).revision,warehouse,rows:values},{withinTransaction:true});
+            }
+            s.db.exec('COMMIT');
+          } catch (error) {s.db.exec('ROLLBACK');throw error;}
+          return send({count:seen.size,state:openingState(s)});
+        }
+        check(false,'期初接口不存在',404);
       }
       if (route==='/api/system-settings' && method==='GET') return send(getSystemSettings(s));
       if (route==='/api/system-settings' && method==='POST') {
@@ -547,6 +692,7 @@ export function createApp({path=':memory:', password, demo=false, demoDocuments=
         const values=await body(req);
         check(validSystemSettings(values),'系统配置无效，请至少启用一种成本算法并检查小数位数');
         return send(s.tx(()=>{
+          if (values.defaultSettlementAccount!=null) check(s.one("SELECT 1 FROM master WHERE kind='accounts' AND active=1 AND id=?",values.defaultSettlementAccount),'请选择启用的默认结算账户');
           const settings=saveSystemSettings(s,values);
           log(s,user,'保存系统配置','成本算法、小数位数和财务设置');
           return settings;
@@ -594,7 +740,8 @@ export function createApp({path=':memory:', password, demo=false, demoDocuments=
         check(mayEditDocument(q.target)&&permits(user,'d:'+q.type),'没有查询关联单据的权限',403);
         check(Object.hasOwn(relatedDocuments,q.target) && relatedDocuments[q.target].includes(q.type),'关联单据类型不匹配');
         const search={type:q.type,page:q.page,keyword:q.keyword,fulfillmentType:orderFulfillment[q.type]===q.target?q.target:null,
-          status:submittedSources.includes(q.type)?'pending,approved,posted,settled':'posted,settled'};
+          status:['receipt','payment'].includes(q.target)?'posted,settled':submittedSources.includes(q.type)?'pending,approved,posted,settled':'posted,settled',
+          onlyUnpaid:['receipt','payment'].includes(q.target)?true:undefined};
         return send({...listDocuments(s,user,search),...listDocuments(s,user,{...search,countOnly:true})});
       }
       if (route==='/api/me' && method==='GET') return send(userView(user));
@@ -605,7 +752,7 @@ export function createApp({path=':memory:', password, demo=false, demoDocuments=
       }
       if (['/api/product-categories','/api/partner-categories'].includes(route)) {
         const kind=route==='/api/partner-categories'?'partners':'products';
-        check(permits(user,'m:'+kind),'没有查看分类权限',403);
+        check(permits(user,'m:'+kind)||(method==='GET'&&kind==='products'&&permits(user,'r:库存状况查询')),'没有查看分类权限',403);
         if (method==='GET') return send({paths:categoryPaths(s,kind)});
         if (method==='POST') {
           check(permits(user,'m:'+kind,'master'),'没有分类维护权限',403);
@@ -653,6 +800,15 @@ export function createApp({path=':memory:', password, demo=false, demoDocuments=
       }
       if (route==='/api/price' && method==='GET') {
         check(permits(user,'m:products'),'没有查看商品价格的权限',403);
+        if (costDocumentTypes.includes(q.type)) {
+          check(permits(user,'d:'+q.type),'没有此单据模块权限',403);
+          if (q.warehouse) {
+            const warehouse=getMaster(s,q.warehouse,'warehouses');
+            const allowed=JSON.parse(user.warehouses);
+            check(user.role==='admin'||!allowed.length||allowed.includes(warehouse.id),'超出仓库权限',403);
+          }
+          return send(inventoryCost(s,Number(q.product),Number(q.warehouse)||null,q.unit,q.batch));
+        }
         return send(lookupPrice(s,Number(q.product),Number(q.partner),number(q.quantity,0,1e6),q.side,number(q.preset||1,1,10)));
       }
       if (route==='/api/documents/validate'&&method==='POST')
@@ -670,7 +826,26 @@ export function createApp({path=':memory:', password, demo=false, demoDocuments=
         const result=listDocuments(s,user,q);
         if (!q.export) return send(result);
         log(s,user,'导出','单据');
-        return sendExcel(['单据编号','单据类型','单据日期','往来单位','仓库','状态','含税金额','摘要'],result.rows.map(r=>[r.number,families[r.type][0],r.date,r.partnerName,r.warehouseName,statusNames[r.status],(r.total/100).toFixed(2),r.summary]));
+        const cash=value=>((value||0)/100).toFixed(2);
+        const rows=result.rows.map(r=>[r.number,families[r.type][0],r.date,r.partnerName,r.warehouseName,
+          r.reversalOf?'红冲单':r.reversed?'已红冲':statusNames[r.status],r.quantity,cash(r.gross),cash(r.reduction),
+          cash(r.total),cash(r.settled),r.outstanding==null?'—':cash(r.outstanding),r.summary]);
+        if (result.totals) {
+          const totals=result.totals;
+          rows.push(['合计','','','','','',totals.quantity,...['gross','reduction','total','settled','outstanding'].map(key=>totals[key]==null?'—':cash(totals[key]))]);
+        }
+        const tradeRows=result.rows.filter(row=>tradeTypes.includes(row.type));
+        if (tradeRows.length) {
+          rows.push([],['单据编号',...tradeColumns]);
+          for (const row of tradeRows) {
+            const doc=getDocument(s,user,row.id);
+            rows.push(...doc.lines.map(line=>[row.number,...tradeLineRow(line,doc.data)]));
+            rows.push([row.number,...tradeTotalRow(doc.tradeAmounts)]);
+            const accountName=id=>id?s.one('SELECT name FROM master WHERE id=?',id)?.name:'';
+            rows.push(...tradeSettlementRows(doc,accountName).map(values=>[row.number,...values]));
+          }
+        }
+        return sendExcel(['单据编号','单据类型','单据日期','往来单位','仓库','状态','合计数量','含税金额','优惠金额','应结金额','已结金额','未结金额','摘要'],rows);
       }
       const attachment=route.match(/^\/api\/attachments\/(\d+)$/);
       if (attachment && method==='GET') {
@@ -690,7 +865,7 @@ export function createApp({path=':memory:', password, demo=false, demoDocuments=
         const to=String(input.to||today());
         check((!from || /^\d{4}-\d{2}-\d{2}$/.test(from)) && /^\d{4}-\d{2}-\d{2}$/.test(to) && from<=to && to<=today(),'对账日期无效');
         const result=report(s,user,'对账',{partner:party.id,from,to});
-        check(result.rows.length && result.rows.length<=1000,'没有可分享的对账流水或范围超过 1000 条');
+        check((result.rows.length||result.summary?.rows.length) && result.rows.length<=1000,'没有可分享的对账流水或范围超过 1000 条');
         const key=randomBytes(32).toString('hex');
         s.tx(()=>{
           s.run('DELETE FROM statement_links WHERE expires<=?',Date.now());
@@ -764,6 +939,7 @@ export function createApp({path=':memory:', password, demo=false, demoDocuments=
           const result=queryMasters(s,user,kind,q.export?{...q,all:'1'}:q);
           if (!q.export) return send(result);
           log(s,user,'导出',masters[kind][0]);
+          if (kind==='accounts') return sendExcel(['编号','名称','状态','期初余额','当前余额'],result.rows.map(row=>[row.code,row.name,row.active?'启用':'停用',(row.openingBalance/100).toFixed(2),(row.balance/100).toFixed(2)]));
           if (kind==='partners') return sendExcel(['单位编号','单位名称','类型','当前应付账款','当前应收账款','经手人','价格等级','公司地址','电话','状态'],
             result.rows.map(row=>[row.code,row.name,({customer:'客户',supplier:'供应商',both:'客户、供应商'})[row.data.type],
               ((row.payable||0)/100).toFixed(2),((row.receivable||0)/100).toFixed(2),row.data.handler,row.data.priceLevel,
@@ -778,20 +954,24 @@ export function createApp({path=':memory:', password, demo=false, demoDocuments=
       if (route==='/api/report' && method==='GET') {
         check(permits(user,'r:'+q.name,q.export?'export':'view'),'没有访问该报表的权限',403);
         const result=report(s,user,q.name,q);
-        if (q.export) {log(s,user,'导出',q.name);return sendExcel(result.columns,result.rows);}
+        if (q.export) {
+          log(s,user,'导出',q.name);
+          if (result.summary) return sendExcel(result.summary.columns,[...result.summary.rows,[],result.columns,...result.rows,...(result.totalRow?[result.totalRow]:[])]);
+          return sendExcel(result.columns,result.totalRow?[...result.rows,result.totalRow]:result.rows);
+        }
         const page=Math.max(1,Math.min(100000,Math.floor(Number(q.page)||1)));
         const start=(page-1)*25;
         return send({...result,count:result.rows.length,rows:result.rows.slice(start,start+25),
           documentIds:result.documentIds?.slice(start,start+25)});
       }
       if (route==='/api/close' && method==='POST') return send(closeMonth(s,user,(await body(req)).month));
-      send({error:'页面不存在'},404);
+      sendError(404,'页面不存在','NOT_FOUND');
     } catch (error) {
       if (error.code?.startsWith('SQLITE')||error.code==='ERR_SQLITE_ERROR') {
-        if (String(error.message).includes('UNIQUE constraint')) return send({error:'编号或用户名已存在'},409);
+        if (String(error.message).includes('UNIQUE constraint')) return sendError(409,'记录与已有数据冲突','DATA_CONFLICT');
       }
       if (!error.status) console.error(error);
-      if (!res.headersSent) send({error:error.status?error.message:'系统处理失败，请重试',...(error.status?{message:error.message,code:error.code,field:error.field,documentId:error.documentId}:{})},error.status||500);
+      if (!res.headersSent) sendError(error.status||500,error.status?error.message:'系统处理失败，请重试',error.status?error.code:'INTERNAL_ERROR',error.field,error.documentId?{documentId:error.documentId}:{});
       else res.end();
     }
   });
@@ -803,5 +983,5 @@ if (process.argv[1] && resolve(process.argv[1])===fileURLToPath(import.meta.url)
   const {server}=createApp({path:process.env.ERP_DB || 'data/erp.sqlite',password:process.env.ERP_ADMIN_PASSWORD || (demo?'Demo-Inventory-2026':undefined),demo,demoDocuments:demo,secure:process.env.ERP_SECURE_COOKIE==='1'});
   const host=process.env.ERP_HOST||'127.0.0.1';
   const port=Number(process.env.PORT||3000);
-  server.listen(port,host,()=>console.log('恒序进销存 http://'+host+':'+server.address().port));
+  server.listen(port,host,()=>console.log('零售批发进销存系统 http://'+host+':'+server.address().port));
 }

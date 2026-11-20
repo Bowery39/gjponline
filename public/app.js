@@ -1,8 +1,10 @@
+import {renderTemplateCenter,showPrintPreview} from './print-designer.js';
+import {renderOpening} from './opening.js';
 import { showSystemPrompt, clearSystemPrompts, chineseMessage, validateForm } from './system-prompt.js';
 import { permits, permissionModules, permissionLabels, documentTypesFor } from './permissions.js';
-import { costMethods, defaultSystemSettings, documentTaxInclusive, lineAmounts, roundDecimal, unitPrice } from './system-settings.js';
-import { documentFields, documentDefaults, fieldSections } from './document-settings.js';
-import { families, masters, reports, statusNames, stockEffects, relatedDocuments, settlementFooters, logisticsFooters, orderFulfillment } from './catalog.js';
+import { costMethods, defaultSystemSettings, documentTaxInclusive, lineAmounts, roundDecimal, unitPrice, costDocumentTypes, settlementNotice, tradeTypes, tradeFields, tradeColumns, tradeTotalKeys, tradeSettlementLabels, tradeSettlementRows, tradeLine, tradeLineSign, priceFromTradeGrossInput, tradeLineRow, tradeTotalRow } from './system-settings.js';
+import { documentFields, documentDefaults, fieldSections, existingReturnLine, isLinkedReturn, loadDocumentSource, mergeReturnLine, uniqueSourceLines } from './document-settings.js';
+import { families, masters, reports, statusNames, stockEffects, relatedDocuments, settlementFooters, logisticsFooters, orderFulfillment, settlementTypes } from './catalog.js';
 import { productUnits, unitDetails, defaultProductUnit } from './units.js';
 import { code39 } from './barcode.js';
 import { showDocumentPicker, closePicker } from './document-picker.js';
@@ -21,30 +23,39 @@ documentEditor.className='document-editor';
 const state={user:null,active:'home',tabs:['home'],group:'',folded:false,flow:'sale',pages:new Map(),editor:null};
 const documentTabs=new Map();
 const maxDocumentLines=500;
+const maxOpenTabs=12;
+let tabLimitPrompt;
 const hasLineItem=line=>Boolean(line?.product||line?.ledgerAccount);
 let nextDocumentTab=0;
 const tabRoute=id=>documentTabs.get(id)?.route||routes[id];
 const roleNames={admin:'管理员',clerk:'制单员',reviewer:'审核员',viewer:'只读职员'};
-const actions={submit:'提交审核',approve:'通过审核',unapprove:'反审核',reject:'驳回',post:'记账',settle:'确认结算',stop:'截停',delete:'删除',restore:'恢复'};
+const actions={submit:'提交审核',approve:'通过审核',unapprove:'反审核',reject:'驳回',post:'记账',reverse:'红冲',settle:'确认结算',stop:'截停',delete:'删除',restore:'恢复'};
 const transitions={draft:['submit','stop','delete'],pending:['approve','reject','stop'],approved:['post','unapprove'],posted:['settle'],rejected:['submit','delete'],stopped:['restore','delete'],deleted:['restore']};
-const groups={'资料':'▦','采购':'⇣','销售':'⇡','客户':'♧','仓储':'▤','库存':'▥','财务':'¥','综合':'▧','系统':'⚙'};
+const groups={'期初建账':'◇','资料':'▦','采购':'⇣','销售':'⇡','客户':'♧','仓储':'▤','库存':'▥','财务':'¥','综合':'▧','系统':'⚙'};
 const routes={home:{label:'工作台',group:'首页'}};
 for (const group of Object.keys(groups)) routes['g:'+group]={label:group,group};
-for (const [key,[label,group]] of Object.entries(masters)) routes['m:'+key]={label,group,kind:'master',key};
+const hiddenMasterRoutes=new Set(['bundles','tiers','shippingTemplates','printers','owners']);
+for (const [key,[label,group]] of Object.entries(masters)) {
+  if (!hiddenMasterRoutes.has(key)) routes['m:'+key]={label,group,kind:'master',key};
+  if (key==='users') routes['staff-permissions']={label:'职员权限',group:'系统',kind:'permissions'};
+}
 for (const [key,[label,,group]] of Object.entries(families)) {
   const newLabel=key==='count'?'新增盘点':label.includes('分摊')||group==='财务'||key.startsWith('opening')?label:'新增'+label;
   const listLabel=key==='count'?'盘点记录':key==='transfer'?'调拨单查询':label.endsWith('订单')||['inquiry','quote'].includes(key)?label+'管理':label+'查询';
-  routes['n:'+key]={label:newLabel,group,kind:'new',key};
-  routes['d:'+key]={label:listLabel,group,kind:'docs',key};
+  routes['n:'+key]={label:newLabel,group,kind:'new',key,hidden:key.startsWith('opening')};
+  routes['d:'+key]={label:listLabel,group,kind:'docs',key,hidden:key.startsWith('opening')};
 }
-for (const [group,names] of Object.entries(reports)) for (const name of names) routes['r:'+name]={label:name,group,kind:'report',key:name};
+for (const [group,names] of Object.entries(reports)) for (const name of names) {
+  if (name!=='客户流失预警分析') routes['r:'+name]={label:name,group,kind:'report',key:name};
+}
 for (const [key,label,group,status] of [
   ['all','单据中心','综合',''],['draft','单据草稿','综合','draft,rejected'],['pending','单据审核中心','综合','pending,approved'],
   ['purchase','采购单据查询','采购',''],['sales','销售单据查询','销售',''],['stock','库存变动单据查询','仓储',''],['finance','财务单据查询','财务','']
 ]) routes['l:'+key]={label,group,kind:'docs',filter:key==='all'||status?'':group,status};
+for (const [key,label] of Object.entries({stock:'期初库存商品',partners:'期初应收应付',accounts:'期初收支账户',balance:'期初资产负债表',control:'开账'}))
+  routes['opening:'+key]={label,group:'期初建账',kind:'opening',key};
 routes['data-backups']={label:'数据备份',group:'系统',kind:'maintenance'};
 routes['data-rebuild']={label:'数据重建',group:'系统',kind:'maintenance'};
-routes['staff-permissions']={label:'职员权限',group:'系统',kind:'permissions'};
 const allow=(id,action)=>permits(state.user,id,action);
 const canSave=(type,action='create')=>allow('d:'+type,action);
 const mayConfigure=type=>canSave(type)||canSave(type,'edit');
@@ -54,7 +65,8 @@ const listedDocumentTypes=(route,action='view')=>documentTypesFor(state.user,act
 function routeAllows(id,action='view') {
   const route=tabRoute(id);
   if (!route?.kind) return !!route;
-  if (['permissions','maintenance'].includes(route.kind)) return state.user?.role==='admin';
+  if(route.key==='templates')return allow('m:templates','design');
+  if (['permissions','maintenance','opening'].includes(route.kind)) return state.user?.role==='admin';
   if (route.kind==='new') return canSave(route.key);
   if (route.kind==='docs') {
     const types=listedDocumentTypes(route,action);
@@ -68,6 +80,12 @@ const escape=value=>String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<'
 const e=escape;
 const money=cents=>(Number(cents||0)/100).toFixed(2);
 const currentDate=()=>new Date().toLocaleDateString('sv-SE');
+function defaultQueryDates() {
+  const now=new Date();
+  const start=new Date(now);
+  start.setDate(start.getDate()-7);
+  return {from:start.toLocaleDateString('sv-SE'),to:now.toLocaleDateString('sv-SE')};
+}
 const weekDate=()=>new Intl.DateTimeFormat('zh-CN',{dateStyle:'full'}).format(new Date());
 const glyph=s=>'<span class="glyph" aria-hidden="true">'+e(s)+'</span>';
 const btn=(label,action,value='',cls='')=>'<button type="button" class="btn '+e(cls)+'" data-act="'+e(action)+'" data-value="'+e(value)+'">'+e(label)+'</button>';
@@ -84,13 +102,14 @@ const empty=message=>'<div class="empty">'+e(message)+'</div>';
 const skeleton=()=>'<div class="skeleton" aria-label="正在查询">'+Array(5).fill('<i></i>').join('')+'</div>';
 const exportLink=(base,params)=>'<a class="btn" data-act="download-file" href="'+e(base+'?'+searchParams({...params,export:'1'}))+'">导出 Excel</a>';
 const menu=(text,buttons)=>'<details class="details-menu"><summary class="btn">'+e(text)+' ⌄</summary><div class="menu-list">'+buttons.join('')+'</div></details>';
-async function api(path,values) {
+async function api(path,values,binary=false) {
   let response;
   try {
     response=await fetch(path,values===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(values)});
   } catch {
     throw Error('无法连接系统，请检查网络后重试。');
   }
+  if(binary&&response.ok)return response.blob();
   const data=await response.json().catch(()=>{throw Error('系统暂时无法响应，请稍后重试。');});
   if (!response.ok) {
     if (response.status===401&&state.user) {state.user=null;showLogin();}
@@ -105,7 +124,7 @@ function showLogin() {
   documentEditor.replaceChildren();
   state.editor=null;
   if (dialog.open) dialog.close();
-  root.innerHTML='<main class="login"><section class="login-art"><span class="brand-mark">恒</span><h1>恒序进销存</h1><p>管理门店与仓库的采购、销售、库存和资金往来。</p></section><section class="login-side"><h2>登录工作台</h2><form novalidate id="login-form">'+field('用户名',input('username','','required autocomplete="username"'),true)+field('密码',input('password','','required type="password" autocomplete="current-password"'),true)+'<button class="btn primary">登录</button></form></section></main>';
+  root.innerHTML='<main class="login"><section class="login-art"><h1>零售批发进销存系统</h1><p>管理门店与仓库的采购、销售、库存和资金往来。</p></section><section class="login-side"><h2>登录工作台</h2><form novalidate id="login-form">'+field('用户名',input('username','','required autocomplete="username"'),true)+field('密码',input('password','','required type="password" autocomplete="current-password"'),true)+'<button class="btn primary">登录</button></form></section></main>';
   document.querySelector('#login-form').addEventListener('submit', async event=>{
     event.preventDefault();
     const form=event.currentTarget;
@@ -151,11 +170,11 @@ function shell() {
   const selected=tabRoute(state.active);
   const nav=Object.entries(groups).map(([group,icon])=>{
     const open=state.group===group;
-    const routeButtons=open?'<div class="subnav">'+Object.entries(routes).filter(([id,r])=>r.group===group&&r.kind&&showRoute(id)).map(([id,r])=>'<button type="button" data-act="open" data-value="'+e(id)+'" class="'+(id===state.active?'selected':'')+'">'+e(r.label)+'</button>').join('')+'</div>':'';
+    const routeButtons=open?'<div class="subnav">'+Object.entries(routes).filter(([id,r])=>r.group===group&&r.kind&&!r.hidden&&showRoute(id)).map(([id,r])=>'<button type="button" data-act="open" data-value="'+e(id)+'" class="'+(id===state.active?'selected':'')+'">'+e(r.label)+'</button>').join('')+'</div>':'';
     return '<div><button class="nav-row '+(selected.group===group?'active':'')+'" aria-expanded="'+open+'" aria-label="'+e(group)+'" title="'+e(group)+'" data-act="group" data-value="'+e(group)+'"><span class="nav-icon">'+icon+'</span><span class="nav-copy">'+e(group)+'</span><span class="nav-arrow">›</span></button>'+routeButtons+'</div>';
   }).join('');
-  root.innerHTML='<div class="shell '+(state.folded?'folded':'')+'"><aside class="sidebar"><div class="brand"><span class="brand-mark">恒</span><span class="nav-copy">恒序进销存</span></div><div class="nav-caption">工作空间</div><div class="nav-scroll"><button title="工作台" class="nav-row '+(state.active==='home'?'active':'')+'" data-act="open" data-value="home">'+glyph('⌂')+'<span class="nav-copy">工作台</span></button>'+nav+'</div><div class="nav-foot"><button class="nav-row" data-act="fold" title="折叠或展开导航">'+glyph('☰')+'<span class="nav-copy">折叠导航</span></button></div></aside>'+
-    '<header class="topbar"><div class="top-heading"><span>◇</span> 零售批发工作台</div><div class="search">'+glyph('⌕')+'<input type="search" id="function-search" placeholder="输入关键词搜索功能" aria-label="搜索功能" autocomplete="off"><div id="search-results" class="search-results" hidden></div></div>'+
+  root.innerHTML='<div class="shell '+(state.folded?'folded':'')+'"><aside class="sidebar"><div class="brand"><span class="nav-copy">零售批发进销存系统</span></div><div class="nav-caption">工作空间</div><div class="nav-scroll"><button title="工作台" class="nav-row '+(state.active==='home'?'active':'')+'" data-act="open" data-value="home">'+glyph('⌂')+'<span class="nav-copy">工作台</span></button>'+nav+'</div><div class="nav-foot"><button class="nav-row" data-act="fold" title="折叠或展开导航">'+glyph('☰')+'<span class="nav-copy">折叠导航</span></button></div></aside>'+
+    '<header class="topbar"><div class="top-heading"><span>◇</span> 零售批发进销存系统</div><div class="search">'+glyph('⌕')+'<input type="search" id="function-search" placeholder="输入关键词搜索功能" aria-label="搜索功能" autocomplete="off"><div id="search-results" class="search-results" hidden></div></div>'+
     '<div class="profile"><button class="icon-btn" data-act="notice" aria-label="消息通知">'+glyph('♧')+'</button><span class="avatar">'+e(state.user.name.slice(0,1))+'</span><span class="profile-name">'+e(state.user.name)+'</span><button class="icon-btn" title="退出登录" aria-label="退出登录" data-act="logout">↪</button></div></header>'+
     '<div class="tabs" role="tablist"></div><main class="content" id="content"></main></div>';
   refreshTabs();
@@ -195,12 +214,19 @@ function pageState(id=state.active) {
   if (!state.pages.has(id)) state.pages.set(id,{params:{page:1,...(id==='m:partners'?{active:'1'}:{})},requested:id!=='r:库存状况查询',detail:null});
   return state.pages.get(id);
 }
+function canOpenTab(id) {
+  if (state.tabs.includes(id)||state.tabs.length<maxOpenTabs) return true;
+  tabLimitPrompt??=showSystemPrompt('最多可打开 '+maxOpenTabs+' 个标签页（含工作台）。请先关闭一个标签页，再打开新页面。')
+    .finally(()=>{tabLimitPrompt=null;});
+  return false;
+}
 function openRoute(id) {
   const search = document.querySelector('#search-results');
   if (search) search.hidden=true;
   const route=tabRoute(id);
   if (!route||!showRoute(id)) return;
   if (route.kind==='new') return editDocument(route.key);
+  if (!canOpenTab(id)) return;
   if (!state.tabs.includes(id)) state.tabs.push(id);
   state.active=id;
   if (route.group!=='首页') state.group=route.group;
@@ -208,12 +234,12 @@ function openRoute(id) {
 }
 function title(route) {return '<div class="page-title"><div><p class="crumb">工作台　/　'+e(route.group)+'</p><h1>'+e(route.label)+'</h1></div></div>';}
 function directory(route) {
-  return title(route)+'<section class="card"><div class="section-head"><h2>功能目录</h2></div><div class="shortcut-grid">'+Object.entries(routes).filter(([id,r])=>r.group===route.group&&r.kind&&showRoute(id)).map(([id,r])=>'<button class="shortcut" data-act="open" data-value="'+e(id)+'"><span class="tile-icon" data-tone="blue">'+glyph(groups[route.group])+'</span>'+e(r.label)+'<span class="chevron">›</span></button>').join('')+'</div></section>';
+  return title(route)+'<section class="card"><div class="section-head"><h2>功能目录</h2></div><div class="shortcut-grid">'+Object.entries(routes).filter(([id,r])=>r.group===route.group&&r.kind&&!r.hidden&&showRoute(id)).map(([id,r])=>'<button class="shortcut" data-act="open" data-value="'+e(id)+'"><span class="tile-icon" data-tone="blue">'+glyph(groups[route.group])+'</span>'+e(r.label)+'<span class="chevron">›</span></button>').join('')+'</div></section>';
 }
 async function renderSystemSettings(content) {
   content.innerHTML='<section class="card system-config">'+skeleton()+'</section>';
   try {
-    const settings=await api('/api/system-settings');
+    const [settings,accounts]=await Promise.all([api('/api/system-settings'),api('/api/master/accounts?active=1&all=1')]);
     if (state.active!=='m:settings'||!content.isConnected) return;
     const choice=(key,values)=>select(key,values,settings[key],'required');
     const digits=[0,1,2,3,4].map(value=>[value,value]);
@@ -228,7 +254,11 @@ async function renderSystemSettings(content) {
       (key==='moving'?'<details class="system-cost-source"><summary>设置成本取值来源</summary>'+
         field('盘盈和无来源退货',choice('movingSource',[['stock','库存均价优先'],['document','单据单价优先']]))+'</details>':'')+
       '<p>'+e(notes[key])+'</p></div>').join('');
-    content.innerHTML=title(routes['m:settings'])+'<div class="toolbar">'+go('staff-permissions')+'</div><form novalidate class="card system-config">'+
+    content.innerHTML=title(routes['m:settings'])+'<form novalidate class="card system-config">'+
+      '<section><h2>公司信息</h2><div class="system-config-row">'+
+      field('公司名称',input('companyName',settings.companyName,'maxlength="300"'))+
+      field('公司地址',input('companyAddress',settings.companyAddress,'maxlength="300"'))+
+      field('公司电话',input('companyPhone',settings.companyPhone,'maxlength="300"'))+'</div></section>'+
       '<section><h2>成本算法</h2>'+algorithms+'</section>'+
       '<section><h2>小数位数设置</h2><div class="system-config-row">'+
       field('数量',choice('quantityDigits',digits))+field('折扣',choice('discountDigits',digits))+
@@ -237,6 +267,7 @@ async function renderSystemSettings(content) {
       field('计税方式',choice('taxMode',[['general','一般计税'],['simple','简易计税']]))+'</div>'+
       '<div class="system-config-row">'+field('采购价格',choice('purchaseTax',taxPrices))+
       field('线下销售价格',choice('saleTax',taxPrices))+'</div><div class="system-config-row">'+
+      field('默认结算账户',select('defaultSettlementAccount',accounts.rows.map(row=>[row.id,row.name]),settings.defaultSettlementAccount,'','不设置'))+
       checkbox('manualClose',settings.manualClose,'手工月结存')+
       '<span class="note">月结后，已结期间的单据受锁定保护。</span></div></section>'+
       '<button type="submit" class="btn primary">保存配置</button></form>';
@@ -254,6 +285,8 @@ async function renderSystemSettings(content) {
         for (const key of ['quantityDigits','discountDigits','priceDigits']) values[key]=Number(form.elements[key].value);
         for (const key of ['movingSource','taxMode','purchaseTax','saleTax']) values[key]=form.elements[key].value;
         for (const key of ['manualClose','taxEnabled']) values[key]=form.elements[key].checked;
+        values.defaultSettlementAccount=Number(form.elements.defaultSettlementAccount.value)||null;
+        for(const key of ['companyName','companyAddress','companyPhone'])values[key]=form.elements[key].value.trim();
         await api('/api/system-settings',values);
         showSystemPrompt('系统配置已保存');
       } catch (failure) {showError(failure);}
@@ -488,14 +521,26 @@ async function mount() {
   documentEditor.replaceChildren();
   if (route.kind==='document-view') {
     content.innerHTML='<section id="detail-area" class="card document-readout"></section>';
-    updateDetails(pageState().detailTab||'items');
+    const viewId=state.active;
+    const page=pageState();
+    updateDetails(page.detailTab||'items');
     document.querySelector('.tab.active')?.scrollIntoView({block:'nearest',inline:'nearest'});
+    if (!page.detail) {
+      content.querySelector('#detail-area').innerHTML=skeleton();
+      try {await documentDetails(tab.documentId);}
+      catch (error) {
+        if (state.active===viewId) content.querySelector('#detail-area').innerHTML=empty(chineseMessage(error));
+      }
+    }
     return;
   }
   if (state.active==='home') {content.innerHTML=home();return;}
   if (route.key==='settings') return renderSystemSettings(content);
+  if (route.key==='templates') return renderTemplateCenter(content,{api,showError,showSystemPrompt,canDesign:allow('m:templates','design')});
   if (route.kind==='permissions') return renderStaffPermissions(content);
   if (route.kind==='maintenance') return renderDataMaintenance(content,state.active);
+  if (route.kind==='opening') return renderOpening(content,route.key,{api,showError,showSystemPrompt,openRoute,
+    onSaved:()=>{catalogData=null;invalidateDocumentPages();}});
   if (!route.kind) {content.innerHTML=directory(route);return;}
   const id=state.active;
   const data=pageState();
@@ -648,17 +693,27 @@ function renderFilters(route,page) {
   if (route.key==='products') return renderProductFilters(page);
   const inventory=['库存状况查询','分仓库存查询','可销售库存查询','可发货库存查询','库存积压统计','库龄统计'].includes(route.key);
   const date=route.kind!=='master'&&!inventory;
+  if (date&&p.from===undefined&&p.to===undefined) Object.assign(p,defaultQueryDates());
   document.querySelector('#page-filter').innerHTML='<div class="filter-head">查询条件</div><form novalidate id="filters-form" class="stack">'+
     field('关键词',input('keyword',p.keyword,'placeholder="输入关键词"'))+
     (date?'<div class="segment"><button type="button" data-act="date" data-value="today">今天</button><button type="button" data-act="date" data-value="three">近 3 天</button></div>'+field('开始日期',input('from',p.from,'type="date"'))+field('结束日期',input('to',p.to,'type="date"')):'')+
-    (route.kind==='docs'?field('状态',select('status',Object.entries(statusNames),p.status,'','全部状态')):'')+
+    (route.kind==='docs'?field('状态',select('status',Object.entries(statusNames),p.status,'','全部状态'))+
+      field('最低应结金额',input('minAmount',p.minAmount,'type="number" step="0.01"'))+field('最高应结金额',input('maxAmount',p.maxAmount,'type="number" step="0.01"')):'')+
     (orderFulfillment[route.key]?field('执行情况',select('execution',Object.entries(executionLabels),p.execution,'','全部执行状态')):'')+
+    (route.key==='库存状况查询'?field('商品分类',select('category',(page.stockCategories||[]).map(path=>[path,path]),p.category,'','全部分类')):'')+
     '<details><summary class="note">更多查询条件</summary>'+
     (inventory?field('停用过滤',select('inactive',[['1','包括停用']],p.inactive,'','仅启用'))+
       field('数量过滤',select('stockQuantity',[['positive','正库存'],['zero','零库存']],p.stockQuantity,'','不限数量'))+
       field('成本算法',select('method',costing,p.method,'','全部成本算法')):'')+
     (route.kind==='master'?field('资料状态',select('active',[['1','启用'],['0','停用']],p.active,'','全部状态')):field('仓库',select('warehouse',page.warehouses||[],p.warehouse,'','全部仓库')))+
     '</details><button class="btn primary">查询</button></form>';
+  if (route.key==='库存状况查询') api('/api/product-categories').then(({paths})=>{
+    page.stockCategories=paths;
+    const node=document.querySelector('#filters-form select[name=category]');
+    if (!node||pageState()!==page) return;
+    const selected=node.value||p.category;
+    node.innerHTML=options(paths.map(path=>[path,path]),selected,'全部分类');
+  }).catch(error=>{if(pageState()===page) showError(error);});
   if (route.kind!=='master'&&!page.warehouses&&allow('m:warehouses')) api('/api/master/warehouses?active=1&all=1').then(data=>{
     page.warehouses=data.rows.map(r=>[r.id,r.name]);
     const node=document.querySelector('#filters-form select[name=warehouse]');
@@ -721,7 +776,7 @@ function renderPage(route,page) {
   if (route.kind==='docs') {
     const types=listedDocumentTypes(route,'create');
     if (page.result?.rows.length) {
-      controls+=menu('批量操作',bulkDocumentActions.map(action=>btn(actions[action],'documents-bulk-action',action)))+
+      controls+=menu('批量操作',bulkDocumentActions.map(action=>btn(actions[action],'documents-bulk-action',action)))+btn('批量打印','print-selected')+
         '<span class="note" data-selection-count aria-live="polite">已选 0 张</span>';
     }
     if (types.length) controls+=route.key?go('n:'+key,'新增'):menu('新增单据',types.map(type=>go('n:'+type,families[type][0])));
@@ -786,24 +841,24 @@ function columnHandle(id,label,width) {
     '" aria-valuemin="44" aria-valuemax="1000" aria-valuenow="'+width+'" data-column="'+e(id)+'"></span>';
 }
 
-function resizeTable(columns,rows,key,className='') {
+function resizeTable(columns,rows,key,className='',footer='') {
   const widths=columnWidths(columns,key);
   const head=columns.map(([id,label],index)=>'<th scope="col">'+e(label)+columnHandle(id,label,widths[index])+'</th>').join('');
   return '<div class="scroll-table"><table class="resizable-table '+e(className)+'" data-width-key="'+e(key)+'" style="width:'+
     widths.reduce((a,b)=>a+b,0)+'px"><colgroup>'+widths.map(width=>'<col style="width:'+width+'px">').join('')+
-    '</colgroup><thead><tr>'+head+'</tr></thead><tbody>'+rows.join('')+'</tbody></table></div>';
+    '</colgroup><thead><tr>'+head+'</tr></thead><tbody>'+rows.join('')+'</tbody>'+footer+'</table></div>';
 }
 
 const documentColumnDefaults={
   选择:62,行号:60,操作:84,单据编号:185,单据类型:122,日期:120,单据日期:120,往来单位:160,仓库:110,状态:100,
   商品编号:125,商品名称:190,'商品编号 / 名称':220,会计科目:190,单位:85,数量:96,商品单位:90,摘要:180,备注:165
 };
-function documentTable(scope,headers,rows,ids=[],defaults={}) {
+function documentTable(scope,headers,rows,ids=[],defaults={},footer='') {
   const columns=headers.map((label,index)=>{
     const id=ids[index]||label.replace(/^(?:含税|不含税)单价$/,'单价');
     return [id,label,defaults[id]||documentColumnDefaults[label]||Math.max(108,label.length*14+23)];
   });
-  return resizeTable(columns,rows,documentWidthKey(scope));
+  return resizeTable(columns,rows,documentWidthKey(scope),footer?'has-grid-footer':'',footer);
 }
 
 function resizeDocumentPicker(table,scope) {
@@ -827,20 +882,24 @@ function resizeDocumentPicker(table,scope) {
 function productTable(page) {
   const editable=canMaintain('products');
   const columns=[
+    ['rowNumber','行号',60],
     ...(editable?[['actions','操作',115]]:[]),
-    ['code','商品编号',138],['name','商品名称',190],['unit','单位',80],['unitType','单位类型',100],
+    ['code','商品编号',138],['name','商品名称',190],['category','商品分类',160],['unit','单位',80],['unitType','单位类型',100],
     ['factor','换算率',90],['latestPurchase','最近采购价',114],['latestSale','最近售价',105],
-    ['retail','零售价',90],['preset','预设售价 1',110],['active','商品状态',98],['created','创建时间',180]
+    ['retail','零售价',90],['preset','预设售价 1',110],['preset2','预设售价 2',110],['preset3','预设售价 3',110],
+    ['active','商品状态',98],['created','创建时间',180]
   ];
-  const rows=page.result.rows.map(row=>{
+  const firstRow=((page.params.page||1)-1)*25;
+  const rows=page.result.rows.map((row,index)=>{
     const d=row.data||{};
-    const values=[row.code,row.name,d.unit||'',productUnits(d).size>1?'多单位':'固定单位',1,
+    const category=d.category||'未分类';
+    const values=[row.code,row.name,category,d.unit||'',productUnits(d).size>1?'多单位':'固定单位',1,
       row.latestPurchase==null?'':money(row.latestPurchase),row.latestSale==null?'':money(row.latestSale),
-      d.retail??'',d.preset1??'',row.active?'启用':'停用',row.created];
-    const main='<tr data-row="master" data-id="'+row.id+'">'+(editable?'<td class="master-action-cell">'+masterActions('products',row)+'</td>':'')+
+      d.retail??'',d.preset1??'',d.preset2??'',d.preset3??'',row.active?'启用':'停用',row.created];
+    const main='<tr data-row="master" data-id="'+row.id+'"><td>'+(firstRow+index+1)+'</td>'+(editable?'<td class="master-action-cell">'+masterActions('products',row)+'</td>':'')+
       values.map((value,index)=>'<td title="'+e(value)+'">'+(index===1?btn(value,'master-edit',row.id,'product-name'):e(value))+'</td>').join('')+'</tr>';
     const units=page.expandUnits?[...productUnits(d)].slice(1).map(([unit,factor])=>cells([
-      ...(editable?['']:[]),row.code,'↳ '+row.name,unit,'换算单位',factor,'','',unitDetails(d,unit)?.retail??'','','',''
+      '',...(editable?['']:[]),row.code,'↳ '+row.name,category,unit,'换算单位',factor,'','',unitDetails(d,unit)?.retail??'','','','','',''
     ])).join(''):'';
     return main+units;
   });
@@ -889,16 +948,20 @@ document.addEventListener('keydown',event=>{
 function tableContent(route,page) {
   const {result}=page;
   if (route.kind==='docs') {
-    return result.rows.length?documentTable('list:'+(route.key||state.active),['选择','单据编号','单据类型','日期','往来单位','仓库','状态','含税金额','摘要'],result.rows.map(r=>'<tr data-row="document" data-id="'+r.id+'" tabindex="0" title="双击打开原单"><td><input type="checkbox" name="documentSelection" value="'+r.id+'" aria-label="选择 '+e(r.number)+'"></td><td><button type="button" class="link" data-act="document-open-original" data-value="'+r.id+'">'+e(r.number)+'</button></td><td>'+e(families[r.type][0])+'</td><td>'+e(r.date)+'</td><td>'+e(r.partnerName||'—')+'</td><td>'+e(r.warehouseName||'—')+'</td><td><span class="badge" data-state="'+e(r.status)+'">'+e(statusOf(r))+'</span></td><td>'+money(r.total)+'</td><td>'+e(r.summary||'')+'</td></tr>')):empty('没有符合条件的单据');
+    return result.rows.length?documentTable('list:'+(route.key||state.active),['选择','单据编号','单据类型','日期','往来单位','仓库','状态','执行状态','合计数量','含税金额','优惠金额','已结金额','未结金额','摘要'],result.rows.map(r=>'<tr data-row="document" data-id="'+r.id+'" tabindex="0" title="双击打开原单"><td><input type="checkbox" name="documentSelection" value="'+r.id+'" aria-label="选择 '+e(r.number)+'"></td><td><button type="button" class="link" data-act="document-open-original" data-value="'+r.id+'">'+e(r.number)+'</button></td><td>'+e(families[r.type][0])+'</td><td>'+e(r.date)+'</td><td>'+e(r.partnerName||'—')+'</td><td>'+e(r.warehouseName||'—')+'</td><td><span class="badge" data-state="'+e(r.status)+'">'+e(statusOf(r))+'</span></td><td>'+e(executionLabels[r.executionState]||'—')+'</td><td>'+roundDecimal(r.quantity||0,4)+'</td><td>'+money(r.gross)+'</td><td>'+money(r.reduction)+'</td><td>'+money(r.settled)+'</td><td>'+(r.outstanding==null?'—':money(r.outstanding))+'</td><td>'+e(r.summary||'')+'</td></tr>'),
+      [],{},result.totals?'<tfoot>'+cells(['','合计','','','','','','',roundDecimal(result.totals.quantity,4),
+        ...['gross','reduction','settled','outstanding'].map(key=>result.totals[key]==null?'—':money(result.totals[key])),''])+'</tfoot>':''):empty('没有符合条件的单据');
   }
   if (route.kind==='master') {
     if (route.key==='products') return productTable(page);
     const names=route.key==='users'?['用户名','姓名','角色','部门','状态']:['编号','名称','状态','主要信息'];
+    if (route.key==='accounts') names.push('期初余额','当前余额');
     const editable=canMaintain(route.key);
     return result.rows.length?table(editable?['操作',...names]:names,result.rows.map(row=>{
       const data=row.data||{};
       const values=route.key==='users'?[row.username,row.name,roleNames[row.role],row.department,row.active?'启用':'停用']:
         [row.code,row.name,row.active?'启用':'停用',data.phone||data.address||data.description||data.price||''];
+      if (route.key==='accounts') values.push(money(row.openingBalance||0),money(row.balance||0));
       return '<tr data-row="master" data-id="'+row.id+'">'+(editable?'<td class="master-action-cell">'+masterActions(route.key,row)+'</td>':'')+values.map((value,index)=>'<td>'+
         (index===1?'<button class="link" data-act="master-edit" data-value="'+row.id+'">'+e(value)+'</button>':e(value))+'</td>').join('')+'</tr>';
     }),'master-grid'):empty('没有符合条件的资料');
@@ -911,7 +974,10 @@ function tableContent(route,page) {
     if (!Number.isSafeInteger(id)) return cells(row);
     return '<tr data-row="report-document" data-id="'+id+'" tabindex="0" title="双击打开原单">'+row.map(value=>'<td>'+e(value)+'</td>').join('')+'</tr>';
   });
-  return sections+trend+(reportRows.length?documentTable('report:'+route.key,result.columns,reportRows):result.sections?'':empty('没有符合条件的数据'));
+  if (result.totalRow) reportRows.push(cells(result.totalRow).replace('<tr>','<tr class="report-total">'));
+  const summary=result.summary?.rows.length?'<div class="section-head"><h3>期间余额汇总</h3></div>'+
+    documentTable('report:'+route.key+':summary',result.summary.columns,result.summary.rows.map(cells)):'';
+  return sections+trend+summary+(reportRows.length?documentTable('report:'+route.key,result.columns,reportRows):result.sections?'':empty('没有符合条件的数据'));
 }
 
 function modal(title,content,footer='',small=false,closeLabel='关闭') {
@@ -954,7 +1020,7 @@ async function catalog(refresh=false) {
   return catalogData;
 }
 const rowsToOptions=rows=>rows.map(r=>[r.id,r.code+' · '+r.name]);
-const numeric=(key,value,step='0.01')=>input(key,value,'type="number" min="0" step="'+step+'"');
+const numeric=(key,value,step='0.01',max)=>input(key,value,'type="number" min="0" step="'+step+'"'+(max==null?'':' max="'+max+'"'));
 function read(form) {return Object.fromEntries(new FormData(form));}
 function unitRow(row={}) {
   const text=(key,label)=>input('unitRow.'+key,row[key],'aria-label="'+label+'" maxlength="64"');
@@ -1018,6 +1084,8 @@ async function editMaster(id,copy=false,partnerType='customer') {
   const pools=['users','products','bundles','supplierPrices','customerPrices','tiers'].includes(kind)?await catalog():null;
   const data=row?.data||{};
   const settings=kind==='products'?await api('/api/system-settings'):null;
+  const partnerOpening=kind==='partners'&&state.user.role==='admin'?await api('/api/opening/partners'):null;
+  const initialPartner=partnerOpening?.rows.find(record=>record.id===Number(id));
   let details='';
   let units='';
   let base;
@@ -1034,18 +1102,19 @@ async function editMaster(id,copy=false,partnerType='customer') {
     if (kind==='products') {
       base+=productCategoryField(data.category??pageState().params.category)+field('商品类型',select('type',typeChoices,data.type||'stock'))+
         kv('基本单位','unit')+field('单位类型',select('unitMode',[['fixed','固定单位'],['multi','多单位']],data.multiUnit||productUnits(data).size>1?'multi':'fixed','required'))+kv('条码','barcode')+kv('商家编码','sku')+
-        num('零售价','retail')+num('采购价','purchase')+num('参考成本价','referenceCost')+num('最低售价','minimum')+
+        num('零售价','retail')+num('采购价','purchase')+num('参考成本价','referenceCost')+num('最低售价','minimum')+field('税率(%)',numeric('taxRate',data.taxRate??0,'any',100))+
+        [1,2,3].map(level=>num('预设售价 '+level,'preset'+level)).join('')+
         field('成本算法',select('method',costing.filter(([key])=>settings.costMethods.includes(key)||!!id&&!copy&&key===(data.method||'moving')),data.method|| (settings.costMethods.includes('moving')?'moving':settings.costMethods[0]),'required'))+
         '<div>'+checkbox('batch',data.batch,'批次管理')+checkbox('serial',data.serial,'序列号管理')+checkbox('attributeEnabled',data.attributeEnabled,'属性管理')+'</div>'+
         kv('属性','attributes')+field('备注','<textarea name="note" maxlength="300">'+e(data.note)+'</textarea>',false,'span2');
       units=unitSettings(data);
-      const extra=[['开票名称','invoiceName'],['规格','spec'],['型号','model'],['品牌','brand'],['采购周期（天）','leadTime'],['简名','shortName'],['拼音码','pinyin'],['产地','origin'],['商品标签','tags'],['补货方式','replenish'],['税收编码','taxCode'],['商品税率 %','taxRate'],['重量 kg','weight'],['长 cm','length'],['宽 cm','width'],['高 cm','height'],['条码策略','barcodePolicy']];
+      const extra=[['开票名称','invoiceName'],['规格','spec'],['型号','model'],['品牌','brand'],['采购周期（天）','leadTime'],['简名','shortName'],['拼音码','pinyin'],['产地','origin'],['商品标签','tags'],['补货方式','replenish'],['税收编码','taxCode'],['重量 kg','weight'],['长 cm','length'],['宽 cm','width'],['高 cm','height'],['条码策略','barcodePolicy']];
       const warehouseOptions=rowsToOptions(pools.warehouses);
       const supplierOptions=rowsToOptions(pools.partners.filter(p=>['supplier','both'].includes(p.data.type)));
       details='<details><summary class="btn">更多字段</summary><div class="form-grid">'+
         field('默认仓库',select('defaultWarehouse',warehouseOptions,data.defaultWarehouse))+
         field('商品供应商','<select name="suppliers" multiple size="3">'+supplierOptions.map(([id,label])=>
-          '<option value="'+e(id)+'" '+((data.suppliers||[]).includes(String(id))?'selected':'')+'>'+e(label)+'</option>').join('')+'</select>')+extra.map(([label,key])=>kv(label,key)).join('')+Array.from({length:10},(_,i)=>num('预设售价 '+(i+1),'preset'+(i+1))).join('')+
+          '<option value="'+e(id)+'" '+((data.suppliers||[]).includes(String(id))?'selected':'')+'>'+e(label)+'</option>').join('')+'</select>')+extra.map(([label,key])=>kv(label,key)).join('')+Array.from({length:7},(_,i)=>num('预设售价 '+(i+4),'preset'+(i+4))).join('')+
         Array.from({length:14},(_,i)=>kv('自定义字段 '+(i+1),'custom'+(i+1))).join('')+'</div></details>';
     } else if (kind==='partners') {
       base+=field('往来单位类型',select('type',partnerTypeOptions,data.type||partnerType,'required'),true)+
@@ -1066,8 +1135,12 @@ async function editMaster(id,copy=false,partnerType='customer') {
       base+=field('套餐组成','<textarea name="components" required placeholder="每行：商品编号=数量">'+e(items)+'</textarea>',true,'span2');
     }
   }
+  if (partnerOpening&&!partnerOpening.state.opened) {
+    base+=['ar','ap','advanceIn','advanceOut'].map((key,index)=>field(['期初应收','期初应付','期初预收','期初预付'][index],
+      numeric('opening.'+key,money(initialPartner?.[key])))).join('');
+  }
   base+=field('状态',select('active',[['1','启用'],['0','停用']],String(row?.active??1)));
-  state.editor={kind:'master',master:kind,row:copy?null:row,pools,dirty:copy,copyData:copy?data:null};
+  state.editor={kind:'master',master:kind,row:copy?null:row,pools,partnerOpening,dirty:copy,copyData:copy?data:null};
   const label=copy?'复制新增':row?'编辑':'新增';
   modal(editable?(kind==='partners'&&!row?'新增'+partnerTypeOptions.find(([type])=>type===partnerType)[1]:label+masters[kind][0]):masters[kind][0],'<form novalidate id="master-form"><div class="form-grid">'+base+'</div>'+units+details+(editable?'<button type="submit" hidden>保存</button>':'')+'</form>',editable?btn('保存','master-save','','primary')+(kind==='products'?btn('保存并新增','master-save','again')+(row&&!copy?btn('复制新增','master-copy',row.id)+masterActions(kind,row,true):''):''):'',kind!=='products');
   if (!editable) dialog.querySelectorAll('form input,form select,form textarea').forEach(node=>node.disabled=true);
@@ -1118,7 +1191,15 @@ async function saveMasterForm(again) {
       const [code,quantity]=line.split('=');
       return {product:editor.pools.products.find(p=>p.code===code.trim())?.id,quantity:Number(quantity)};
     });
-    payload={id:row?.id,name,code,active,data:{...(row?.data||editor.copyData),...data}};
+    const openingBalances={};
+    for (const key of ['ar','ap','advanceIn','advanceOut']) {
+      if (data['opening.'+key]!==undefined) {
+        openingBalances[key]=data['opening.'+key];
+        delete data['opening.'+key];
+      }
+    }
+    payload={...(Object.keys(openingBalances).length?{openingBalances,openingRevision:editor.partnerOpening.state.revision}:{}),
+      id:row?.id,name,code,active,data:{...(row?.data||editor.copyData),...data}};
   }
   editor.busy=true;
   try {
@@ -1151,16 +1232,15 @@ async function showError(error) {
   }
   return showSystemPrompt(chineseMessage(error));
 }
-const copyFrom={purchaseOrder:'purchase',inquiry:'purchaseOrder',quote:'salesOrder',salesOrder:'sale',purchase:'payment',purchaseExchange:'payment',sale:'receipt',transferOrder:'transfer'};
+const copyFrom={purchaseOrder:'purchase',inquiry:'purchaseOrder',quote:'salesOrder',salesOrder:'sale',purchase:'payment',purchaseExchange:'payment',openingAP:'payment',openingAR:'receipt',sale:'receipt',transferOrder:'transfer'};
 function rowValues(line) {
   return {...line.data,product:line.product,quantity:(line.data.enteredQuantity??line.quantity)/1000,price:unitPrice(line),
     serials:(line.data.serials||[]).join(' '),debit:Number(line.data.debit||0)/100,credit:Number(line.data.credit||0)/100};
 }
-const executionLabels={waiting:'未执行',partial:'部分完成',complete:'已完成',closed:'已终止'};
+const executionLabels={waiting:'未执行',partial:'部分执行',complete:'已完成',closed:'已终止'};
 function sourceDocumentLines(type,ref,pools) {
   if (orderFulfillment[ref.type]!==type) {
-    const bySource=new Map(ref.lines.map(line=>[ref.id+':'+line.position,rowValues(line)]));
-    return [...bySource.values()];
+    return uniqueSourceLines(ref).map(rowValues);
   }
   if (['complete','closed'].includes(ref.execution.state)) throw Error('关联订单已完成或已终止');
   return ref.lines.flatMap((line,index)=>{
@@ -1194,9 +1274,12 @@ function carrySourceTerms(type,ref,fields) {
 }
 async function editDocument(type,id,sourceId) {
   if (!canSave(type,id?'edit':'create')) return;
+  if (type.startsWith('opening')&&(await api('/api/opening/state')).opened)
+    return showSystemPrompt('系统已开账，期初数据只读');
   const alreadyOpen=()=>id&&[...documentTabs.values()].find(editor=>editor.kind==='document'&&editor.doc?.id===Number(id));
   const existing=alreadyOpen();
   if (existing) return openRoute(existing.id);
+  if (!canOpenTab()) return;
   const user=state.user;
   const promise=id?api('/api/documents/'+id):Promise.resolve(null);
   const [pools,doc,directory,systemSettings,settings]=await Promise.all([catalog(true),promise,api('/api/document-directory'),api('/api/system-settings'),
@@ -1208,13 +1291,16 @@ async function editDocument(type,id,sourceId) {
     catch {reference={id:doc.data.reference,number:'原关联单据'};}
   }
   const effect=families[type][4];
-  const lineDefaults=()=>effect==='journal'?{debit:0,credit:0}:{quantity:effect==='count'?0:1,discount:1,tax:0};
+  const lineDefaults=()=>effect==='journal'?{debit:0,credit:0}:{quantity:tradeTypes.includes(type)?'':effect==='count'||type==='openingStock'?0:1,discount:Number(fields.documentDiscount??100)/100,tax:0};
   const defaults={};
   if (!doc) for (const {key,kind} of documentDefaults(type)) {
     const value=settings.defaults[key];
     if (value===undefined) continue;
     if (kind&&kind!=='boolean'&&!pickerRows({type,pools,directory},kind).some(row=>row.id===value)) continue;
     defaults[key]=value;
+  }
+  if (!doc&&(tradeTypes.includes(type)||settlementTypes.includes(type)&&!defaults.account)&&pools.accounts.some(row=>row.id===systemSettings.defaultSettlementAccount)) {
+    defaults.account=systemSettings.defaultSettlementAccount;
   }
   const warehouse=doc?doc.warehouse:(ref?.warehouse??defaults.warehouse??(pools.warehouses.length===1?pools.warehouses[0].id:''));
   const fields={...(doc?doc.data:defaults),date:doc?.date||currentDate(),
@@ -1227,10 +1313,12 @@ async function editDocument(type,id,sourceId) {
     fields.saleExpenses=(doc?.data.saleExpenses||[]).map(row=>({...row,amount:row.amount/100,paid:row.paid/100}));
   }
   if (ref) carrySourceTerms(type,ref,fields);
+  if (type==='openingStock') Object.assign(fields,{discount:1,reduction:0,freight:0});
   const lines=doc?.lines?.map(rowValues)||(!['cash','journal'].includes(effect)&&ref?sourceDocumentLines(type,ref,pools):[]);
   if (state.user!==user) return;
   const openedWhileLoading=alreadyOpen();
   if (openedWhileLoading) return openRoute(openedWhileLoading.id);
+  if (!canOpenTab()) return;
   if (ref&&['exchange','purchaseExchange'].includes(type)) for (const line of lines) line.direction='return';
   const tabId='document:'+ ++nextDocumentTab;
   const title=doc?doc.number:'新增'+families[type][0];
@@ -1255,50 +1343,98 @@ function stashDocument() {
   const fields={};
   for (const [key,value] of Object.entries(values)) {
     const [scope,index,field]=key.split('.');
-    if (scope==='line' && field) editor.lines[Number(index)][field]=value;
+    if (scope==='line' && field) {
+      if (tradeTypes.includes(editor.type)&&['grossUnit','grossAmount','discountPercent','exclusiveUnit'].includes(field)) continue;
+      editor.lines[Number(index)][field]=value;
+    }
     else if (['receipts','saleExpenses'].includes(scope)&&field) editor.fields[scope][Number(index)][field]=value;
     else fields[key]=value;
   }
   if (form.elements.invoice) fields.invoice=form.elements.invoice.checked;
   if (form.elements.fuzzy) fields.fuzzy=form.elements.fuzzy.checked;
   if (form.elements.autoPrice) fields.autoPrice=form.elements.autoPrice.checked;
+  if (form.elements.useAdvance) fields.useAdvance=form.elements.useAdvance.checked;
   Object.assign(editor.fields,fields);
 }
-function priceSummary(editor) {
-  const values=editor.fields;
-  if (['cash','fee'].includes(families[editor.type][4])) return Number(values.amount||0);
-  const discount=Number(values.discount??1);
-  let sum=0;
+function openingLineAmount(editor,row) {
+  const {quantityDigits,priceDigits}=editor.precision;
+  const quantity=roundDecimal(row.quantity||0,quantityDigits);
+  const price=roundDecimal(row.price||0,priceDigits);
+  return lineAmounts(quantity,price,1,0,false).net;
+}
+function draftTradeLine(editor,row) {
+  const {quantityDigits,priceDigits,discountDigits}=editor.precision;
+  return tradeLine(roundDecimal(row.quantity||0,quantityDigits),costDocumentTypes.includes(editor.type)?Number(row.price||0):roundDecimal(row.price||0,priceDigits),
+    costDocumentTypes.includes(editor.type)?1:roundDecimal(row.discount??1,discountDigits)*roundDecimal(editor.fields.discount??1,discountDigits),
+    !costDocumentTypes.includes(editor.type)&&editor.taxEnabled?Number(row.tax||0):0,
+    !costDocumentTypes.includes(editor.type)&&editor.taxInclusive);
+}
+function draftTradeTotals(editor) {
+  const totals=Object.fromEntries(tradeTotalKeys.map(key=>[key,0]));
   for (const row of editor.lines.filter(hasLineItem)) {
-    const rate=editor.taxEnabled?Number(row.tax||0):0;
-    const {net,tax}=lineAmounts(Number(row.quantity||0),Number(row.price||0),Number(row.discount??1)*discount,rate,editor.taxInclusive);
-    sum+=(net+tax)*(['exchange','purchaseExchange'].includes(editor.type)&&row.direction==='return'?-1:1);
+    const values=draftTradeLine(editor,row);
+    for (const key of tradeTotalKeys) totals[key]+=values[key]*tradeLineSign(editor.type,row);
   }
-  return sum/100+Number(values.freight||0)-Number(values.reduction||0);
+  return {...totals,total:totals.gross+Math.round(Number(editor.fields.freight||0)*100)-Math.round(Number(editor.fields.reduction||0)*100)};
+}
+function tradeDisplay(key,value) {
+  if (['baseAmount','net','tax','gross','total','settled','outstanding'].includes(key)) return money(value);
+  return roundDecimal(value,key==='discount'?6:4);
 }
 function updateDocumentAmounts(editor) {
-  const total=priceSummary(editor);
-  const settled=Number(editor.fields.paid||0)+Number(editor.fields.advance||0)+
-    (editor.fields.receipts||[]).reduce((sum,row)=>sum+Number(row.amount||0),0);
-  const current=total-settled;
-  const prior=editor.priorBalance;
-  const element=documentEditor.querySelector('#doc-total');
+  if (editor.type==='openingStock') {
+    const totals=editor.lines.reduce((sum,row)=>{
+      sum.quantity+=roundDecimal(row.quantity||0,editor.precision.quantityDigits);
+      sum.amount+=openingLineAmount(editor,row);
+      return sum;
+    },{quantity:0,amount:0});
+    const quantityTotal=documentEditor.querySelector('#opening-quantity-total');
+    const amountTotal=documentEditor.querySelector('#opening-amount-total');
+    if (quantityTotal) quantityTotal.textContent=roundDecimal(totals.quantity,editor.precision.quantityDigits);
+    if (amountTotal) amountTotal.textContent=money(totals.amount);
+    for (const cell of documentEditor.querySelectorAll('[data-opening-amount]')) {
+      const row=editor.lines[Number(cell.dataset.openingAmount)];
+      cell.textContent=money(openingLineAmount(editor,row));
+    }
+  }
+  if (tradeTypes.includes(editor.type)) {
+    const totals=draftTradeTotals(editor);
+    totals.settled=[editor.fields.paid,editor.fields.advance,...(editor.fields.receipts||[]).map(row=>row.amount)]
+      .reduce((sum,value)=>sum+Math.round(Number(value||0)*100),0);
+    totals.outstanding=Math.abs(totals.total)-totals.settled;
+    const account=documentEditor.querySelector('[data-act="doc-picker"][data-value^="account|"]');
+    account?.setAttribute('aria-required',String(Number(editor.fields.paid)>0));
+    for (const node of documentEditor.querySelectorAll('[data-trade-total]'))
+      node.textContent=tradeDisplay(node.dataset.tradeTotal,totals[node.dataset.tradeTotal]);
+    for (const row of documentEditor.querySelectorAll('[data-trade-line]')) {
+      const index=Number(row.dataset.tradeLine);
+      const line=editor.lines[index];
+      const values=draftTradeLine(editor,line);
+      const source=row.querySelector('[data-trade-source]');
+      if (source) source.textContent=line.source||'手工';
+      for (const node of row.querySelectorAll('[data-trade-value]'))
+        node.textContent=tradeDisplay(node.dataset.tradeValue,values[node.dataset.tradeValue]);
+      for (const key of ['unit','grossUnit','gross','discount']) {
+        const field={unit:'exclusiveUnit',discount:'discountPercent',grossUnit:'grossUnit',gross:'grossAmount'}[key];
+        const control=row.querySelector('[name="line.'+index+'.'+field+'"]');
+        if (control&&control!==document.activeElement)
+          control.value=tradeDisplay(key,values[key]);
+      }
+    }
+  }
+  const quantityTotal=documentEditor.querySelector('#doc-grid-quantity');
+  if (quantityTotal) quantityTotal.textContent=roundDecimal(editor.lines.filter(hasLineItem)
+    .reduce((sum,row)=>sum+Number(row.quantity||0),0),editor.precision.quantityDigits);
   const gridTotal=documentEditor.querySelector('#doc-grid-total');
-  if (gridTotal&&families[editor.type][4]!=='journal') gridTotal.textContent='¥ '+total.toFixed(2);
-  if (!element) return;
-  const balanceLabel=editor.type==='purchase'?'应付':editor.type==='sale'?'应收':'';
-  const summary=['含税金额 ¥ '+total.toFixed(2)];
-  if (balanceLabel) summary.push('本单'+balanceLabel+' ¥ '+current.toFixed(2));
-  if (balanceLabel&&prior!=null) summary.push('此前'+balanceLabel+' ¥ '+prior.toFixed(2),'合计'+balanceLabel+' ¥ '+(current+prior).toFixed(2));
-  element.textContent=summary.join('　|　');
-}
-async function loadPriorBalance(editor) {
-  const partner=String(editor.fields.partner||'');
-  if (!partner||!allow('r:往来单位应收应付')) {editor.priorBalance=null;updateDocumentAmounts(editor);return;}
-  const report=await api('/api/report?'+searchParams({name:'往来单位应收应付',partner}));
-  if (state.editor===editor&&String(editor.fields.partner)===partner) {
-    editor.priorBalance=Number(report.rows[0]?.[editor.type==='purchase'?2:1]||0);
-    updateDocumentAmounts(editor);
+  if (gridTotal) {
+    let gross=0;
+    for (const cell of documentEditor.querySelectorAll('[data-grid-amount]')) {
+      const row=editor.lines[Number(cell.dataset.gridAmount)];
+      const {net,tax}=draftTradeLine(editor,row);
+      cell.textContent=money(net+tax);
+      if (hasLineItem(row)) gross+=net+tax;
+    }
+    gridTotal.textContent=money(gross);
   }
 }
 const pickers={
@@ -1336,15 +1472,21 @@ function pickControl(key,kind,value,label,required=false) {
   const editor=state.editor;
   const row=editor.pickerOptions.get(kind).find(row=>String(row.id)===String(value??''));
   const prior=key==='handlerId'?editor.fields.handler:'';
-  const current=row?.cells.slice(0,2).join(' ')||prior||(key==='department'?value:'');
+  const caption=row?.cells.slice(0,2).join(' ');
+  const current=caption||prior||(key==='department'?value:'');
   return '<button type="button" class="btn doc-pick '+(kind==='products'?'product-select':'')+'" data-act="doc-picker" data-value="'+e([key,kind,label,required?'required':''].join('|'))+
     '" aria-label="'+e(label+(current?' '+current:''))+'" aria-haspopup="dialog"><span>'+e(current||(kind==='products'?'输入编号/名称':'请选择'))+'</span><span class="picker-mark" aria-hidden="true">…</span></button>';
 }
 function applyDocumentProduct(editor,index,product,unit) {
   const row=editor.lines[index];
   row.product=product.id;
+  if (costDocumentTypes.includes(editor.type)) row.discount=1;
+  if (tradeTypes.includes(editor.type)&&row.quantity==='') row.quantity=1;
+  delete row.grossInput;
+  delete row.source;
   row.unit=unit??defaultProductUnit(product.data,families[editor.type][3]);
-  row.tax=editor.taxEnabled?product.data.taxRate??0:0;
+  row.tax=editor.type!=='openingStock'&&!costDocumentTypes.includes(editor.type)&&editor.taxEnabled?product.data.taxRate??0:0;
+  if (editor.type==='openingStock') row.price=openingCost(product,row.unit,editor.precision.priceDigits);
   if (!editor.fields.warehouse&&editor.pools.warehouses.some(w=>w.id===Number(product.data.defaultWarehouse))) editor.fields.warehouse=product.data.defaultWarehouse;
   return applyPrice(editor,index);
 }
@@ -1362,31 +1504,30 @@ function referenceLabels(type) {
 }
 function openReference(type) {
   const editor=state.editor;
+  if (!editor||editor.sourceLoading||editor.busy) return;
   stashDocument();
   showDocumentPicker({
     onTable:table=>resizeDocumentPicker(table,'sources:'+editor.type+':'+type),
-    title:referenceLabels(type),columns:['单据编号','往来单位','单据日期','状态','金额'],
+    title:referenceLabels(type),columns:['单据编号','往来单位','单据日期','状态','单据金额','已结金额','未结金额'],
     selected:editor.reference?.type===type?editor.fields.reference:null,optional:true,
     async load(keyword,page) {
       const result=await api('/api/document-sources?'+searchParams({target:editor.type,type,keyword,page}));
-      return {...result,rows:result.rows.map(row=>({id:row.id,cells:[row.number,row.partnerName||families[type][0],row.date,statusOf(row),money(row.total)]}))};
+      return {...result,rows:result.rows.map(row=>({id:row.id,cells:[row.number,row.partnerName||families[type][0],row.date,statusOf(row),money(row.total),money(row.settled),row.outstanding==null?'—':money(row.outstanding)]}))};
     },
-    async onPick(row,isActive) {
-      if (editor.sourceLoading) return;
-      editor.sourceLoading=true;
-      editor.sourceVersion=(editor.sourceVersion||0)+1;
-      documentEditor.inert=true;
-      try {
-        await applyReference(row,isActive);
-      } finally {
-        editor.sourceLoading=false;
-        documentEditor.inert=false;
-      }
+    onPick(row,isActive) {
+      return loadDocumentSource(editor,{
+        load:()=>row?api('/api/documents/'+row.id):null,
+        isCurrent:()=>editor===state.editor&&isActive(),
+        apply:applyReference,
+        setLoading:loading=>{
+          if (editor!==state.editor) return;
+          setSourceLoading(loading);
+          if (!loading) scheduleDocumentCheck(editor);
+        }
+      });
     }
   });
-  async function applyReference(row,isActive) {
-    const ref=row?await api('/api/documents/'+row.id):null;
-    if (editor!==state.editor||!isActive()) return;
+  function applyReference(ref) {
     const {fields}=editor;
     const imported=ref&&families[editor.type][4]!=='cash'?sourceDocumentLines(editor.type,ref,editor.pools):null;
     if (imported) convertSourcePrices(imported,ref,editor.taxInclusive,editor.precision.priceDigits);
@@ -1407,9 +1548,17 @@ function openReference(type) {
     renderDocument();
   }
 }
+function setSourceLoading(loading) {
+  documentEditor.inert=loading;
+  documentEditor.setAttribute('aria-busy',String(loading));
+  for (const control of documentEditor.querySelectorAll('[data-act="line-add"], [data-act="doc-picker"][data-value*="|products|"]')) {
+    control.disabled=loading;
+  }
+}
 function openDocumentPicker(selection) {
   const [key,kind,label,required]=selection.split('|');
   const editor=state.editor;
+  if (!editor||editor.sourceLoading||editor.busy) return;
   stashDocument();
   const [target,field]=pickerPath(editor,key);
   const multiple=kind==='products';
@@ -1441,20 +1590,23 @@ function openDocumentPicker(selection) {
       return {rows:matches.slice((page-1)*25,page*25),count:matches.length};
     },
     async onPick(row) {
-      if (editor!==state.editor) return;
+      if (editor!==state.editor||editor.sourceLoading||editor.busy) return;
       if (multiple) {
         const products=row.map(item=>editor.pools.products.find(product=>product.id===item.id));
-        const remaining=editor.lines.filter(hasLineItem).length-Number(hasLineItem(target));
-        if (remaining+products.length>maxDocumentLines) throw Error('单据明细最多 500 行');
-        const index=editor.lines.indexOf(target);
-        if (products.length) {
-          editor.lines.splice(index+1,0,...products.slice(1).map(()=>editor.lineDefaults()));
-          editor.dirty=true;
-          await Promise.all(products.map((product,offset)=>applyDocumentProduct(editor,index+offset,product)));
-        } else {
-          Object.assign(target,{product:'',unit:'',price:'',source:''});
-          editor.dirty=true;
+        const additions=products.filter(product=>!existingReturnLine(editor,product.id,undefined,target));
+        const preserveTarget=products.some(product=>existingReturnLine(editor,product.id,undefined,target)===target);
+        const remaining=editor.lines.filter(hasLineItem).length-Number(!preserveTarget&&hasLineItem(target));
+        if (remaining+additions.length>maxDocumentLines) throw Error('单据明细最多 500 行');
+        for (const product of products) mergeReturnLine(editor,product.id,1,{target});
+        if (additions.length) {
+          const index=editor.lines.indexOf(target)+Number(preserveTarget);
+          const newRows=additions.length-Number(!preserveTarget);
+          editor.lines.splice(editor.lines.indexOf(target)+1,0,...Array.from({length:newRows},()=>editor.lineDefaults()));
+          await Promise.all(additions.map((product,offset)=>applyDocumentProduct(editor,index+offset,product)));
+        } else if (!products.length) {
+          Object.assign(target,editor.lineDefaults(),{product:'',unit:'',price:'',source:''});
         }
+        editor.dirty=true;
         if (state.editor===editor) renderDocument();
         return;
       }
@@ -1462,8 +1614,10 @@ function openDocumentPicker(selection) {
       target[field]=row?.id??'';
       editor.dirty=true;
       if (key==='handlerId') editor.fields.handler=row?.cells[1]||'';
+      if (key==='warehouse'&&costDocumentTypes.includes(editor.type)) {
+        await Promise.all(editor.lines.map((line,index)=>applyPrice(editor,index)));
+      }
       if (key==='partner'&&['sale','salesOrder'].includes(editor.type)) {
-        editor.priorBalance=null;
         fillPartnerAddress(editor);
       }
       if (state.editor===editor) renderDocument();
@@ -1600,6 +1754,8 @@ function renderDocument() {
     lines.push(editor.lineDefaults());
   }
   const journal=effect==='journal';
+  const opening=type==='openingStock';
+  const trade=tradeTypes.includes(type);
   const fee=effect==='fee';
   const sale=type==='sale';
   const inbound=type==='purchase';
@@ -1635,6 +1791,7 @@ function renderDocument() {
     inner='<form novalidate id="doc-form"><p id="doc-limit-warning" class="doc-limit-warning" aria-live="polite"></p><div class="doc-header-fields form-grid">'+party+
       (hasStock||optionalWarehouse?head('warehouse',pickControl('warehouse','warehouses',fields.warehouse,warehouseLabel,hasStock),hasStock):'')+
       (hasTarget?head('target',pickControl('target','warehouses',fields.target,'调入仓库',true),true):'')+
+      (trade?field('整单折扣(%)',numeric('documentDiscount',fields.documentDiscount??Number(fields.discount??1)*100,'any',100)):'')+
       head('handlerId',pickControl('handlerId','staff',fields.handlerId,'经手人'))+
       (inbound||salesHeader?head('due',input('due',stash('due'),'type="date"')):'')+
       '<details class="doc-more"'+(editor.headerExpanded?' open':'')+'><summary class="btn">更多</summary><div class="form-grid">'+
@@ -1649,14 +1806,39 @@ function renderDocument() {
       head('note',input('note',stash('note')),false,'span2')+'</div></details></div>';
     if (!cash) {
       const entries=['body','bodyCustom'].flatMap(section=>fieldMap[section].map(f=>[section,f]));
-      const shown=entries.map(([section,f],index)=>({f,index,section})).filter(({section,f})=>visible(section,f)&&(editor.taxEnabled||f.key!=='tax'));
+      const shown=entries.map(([section,f],index)=>({f,index,section})).filter(({section,f})=>
+        (visible(section,f)||opening&&['batch','production'].includes(f.key)&&lines.some(line=>{const product=pools.products.find(product=>product.id===Number(line.product));return product?.data.batch||product?.data.method==='individual';}))&&(trade||editor.taxEnabled||f.key!=='tax')&&!(opening&&section==='body'&&['discount','tax','source'].includes(f.key)));
+      if (opening) {
+        const quantityColumn=shown.findIndex(({f})=>f.key==='quantity');
+        const [quantityField]=quantityColumn<0?[]:shown.splice(quantityColumn,1);
+        const priceColumn=shown.findIndex(({f})=>f.key==='price');
+        const unitColumn=shown.findIndex(({f})=>f.key==='unit');
+        const amountField={f:{key:'openingAmount',label:'期初金额'},section:'body'};
+        shown.splice(Math.max(priceColumn,unitColumn)+1,0,...(quantityField?[quantityField]:[]),amountField);
+      }
+      if (!trade&&!opening&&!journal&&shown.some(({f})=>f.key==='price')) {
+        const index=shown.findIndex(({f})=>f.key==='price');
+        shown.splice(index+1,0,{f:{key:'gridAmount',label:'含税金额'},section:'body'});
+      }
+      if (trade) {
+        const configured=new Map(shown.map(column=>[column.f.key,column]));
+        const computed=new Set(['baseAmount','discountedUnit','net','taxAmount','grossUnit','gross']);
+        const columns=tradeFields.flatMap(([key,label])=>{
+          const column=configured.get(key);
+          if (!column&&!computed.has(key)) return [];
+          return [{...column,section:'body',f:{...column?.f,key,label}}];
+        });
+        shown.splice(0,shown.length,...columns,...shown.filter(column=>column.section==='bodyCustom'));
+      }
       const list=['行号','操作',...shown.map(({section,f})=>{
         const config=rule(section,f);
-        return (config.alias||(f.key==='price'&&editor.taxInclusive?'含税单价':f.label))+(config.required?' *':'');
+        return (config.alias||(f.key==='price'&&editor.taxInclusive&&!opening&&!trade?'含税单价':f.label))+(config.required?' *':'');
       })];
       const itemRows=lines.map((line,i)=>{
         const n=key=>'line.'+i+'.'+key;
-        const lineNum=(key,step)=>numeric(n(key),line[key],step);
+        const lineNum=(key,step)=>costDocumentTypes.includes(type)&&['price','discount','tax'].includes(key)?
+          input(n(key),key==='price'?line[key]:key==='discount'?1:0,'type="number" readonly step="any"'):
+          opening&&key==='quantity'?input(n(key),line[key],'type="number" step="'+step+'"'):numeric(n(key),line[key],step);
         const item=pools.products.find(r=>r.id===Number(line.product));
         const base=item?.data.unit||'';
         const unitOptions=item?[...productUnits(item.data)].filter(([label])=>label).map(([label,factor])=>[label,factor===1?label:label+'（'+factor+base+'）']):[];
@@ -1664,33 +1846,60 @@ function renderDocument() {
           [input(n('batch'),line.batch),input(n('production'),line.production,'type="date"'),
             pickControl(n('product'),'products',line.product,'商品'),e(unitDetails(item?.data||{},line.unit)?.barcode||item?.data.barcode||''),input(n('serials'),line.serials),
             ...(effect==='exchange'?[pickControl(n('direction'),'direction',line.direction||'out','换货方向',true)]:[]),
-            lineNum('quantity',step('quantity')),(unitOptions.length>1?select(n('unit'),unitOptions,line.unit||base):e(base)),lineNum('price',step('price')),lineNum('discount',step('discount')),lineNum('tax'),input(n('expiry'),line.expiry,'type="date"'),e(line.source||'手工'),input(n('note'),line.note)];
+            lineNum('quantity',step('quantity')),(unitOptions.length>1?select(n('unit'),unitOptions,line.unit||base):e(base)),lineNum('price',step('price')),lineNum('discount',step('discount')),(trade?numeric(n('tax'),line.tax,'any',100):lineNum('tax')),input(n('expiry'),line.expiry,'type="date"'),e(line.source||'手工'),input(n('note'),line.note)];
         columns.push(...fieldMap.bodyCustom.map(f=>input(n(f.key),line[f.key],'maxlength="200"')));
         const pending=i===lines.length-1&&!hasLineItem(line);
         const actions='<button type="button" class="btn" data-act="line-add" data-value="'+i+'" aria-label="在第 '+(i+1)+' 行后插入">+</button>'+
           (pending?'':'<button type="button" class="btn danger" data-act="line-remove" data-value="'+i+'" aria-label="删除第 '+(i+1)+' 行">−</button>');
-        return '<tr'+(pending?' class="doc-entry-row"':'')+'><td class="doc-line-number">'+(i+1)+'</td><td class="doc-line-actions">'+actions+'</td>'+
-          shown.map(({index})=>'<td>'+columns[index]+'</td>').join('')+'</tr>';
+        const tradeControls=trade?{
+          product:columns[2]+(effect==='exchange'?columns[5]:''),
+          source:'<output data-trade-source>'+e(line.source||'手工')+'</output>',
+          price:numeric(n('exclusiveUnit'),draftTradeLine(editor,line).unit,'any'),
+          discount:'<span class="trade-percent">'+numeric(n('discountPercent'),draftTradeLine(editor,line).discount,'any',100)+'<span aria-hidden="true">%</span></span>',
+          grossUnit:numeric(n('grossUnit'),draftTradeLine(editor,line).grossUnit,'any'),
+          baseAmount:'<output data-trade-value="baseAmount"></output>',discountedUnit:'<output data-trade-value="discountedUnit"></output>',
+          net:'<output data-trade-value="net"></output>',taxAmount:'<output data-trade-value="tax"></output>',gross:numeric(n('grossAmount'),money(draftTradeLine(editor,line).gross),'0.01')
+        }:{};
+        return '<tr'+(trade?' data-trade-line="'+i+'"':'')+(pending?' class="doc-entry-row"':'')+'><td class="doc-line-number">'+(i+1)+'</td><td class="doc-line-actions">'+actions+'</td>'+
+          shown.map(({f,index})=>f.key==='openingAmount'?'<td data-opening-amount="'+i+'">'+money(openingLineAmount(editor,line))+'</td>':f.key==='gridAmount'?'<td data-grid-amount="'+i+'"></td>':
+            '<td>'+(tradeControls[f.key]??columns[index])+'</td>').join('')+'</tr>';
       });
+      const footerCells=trade?'<td></td>'+shown.map(({f})=>{
+        const key=f.key==='taxAmount'?'tax':f.key==='tax'?'':f.key;
+        return '<td>'+(tradeTotalKeys.includes(key)?'<output data-trade-total="'+key+'"></output>':'')+'</td>';
+      }).join(''):opening?'<td></td>'+shown.map(({f})=>
+        f.key==='quantity'?'<td id="opening-quantity-total"></td>':
+        f.key==='openingAmount'?'<td id="opening-amount-total"></td>':'<td></td>').join(''):
+        '<td></td>'+shown.map(({f})=>'<td>'+
+          (f.key==='quantity'?'<output id="doc-grid-quantity"></output>':f.key==='gridAmount'?'<output id="doc-grid-total"></output>':'')+'</td>').join('');
+      const gridFooter='<tfoot><tr><th scope="row">合计</th>'+footerCells+'</tr></tfoot>';
+      itemRows.push('<tr class="doc-grid-spacer" aria-hidden="true"><td colspan="'+list.length+'"></td></tr>');
       inner+='<div class="toolbar doc-tools" aria-label="明细工具">'+btn('增行','line-add')+(!journal?input('scan','','placeholder="条码扫描输入" aria-label="条码扫描输入"')+btn('扫码添加','scan','','doc-tool')+checkbox('fuzzy',fields.fuzzy,'扫码枪模糊匹配')+'<label class="btn doc-import-label">导入商品<input type="file" id="doc-import-file" aria-label="导入商品" accept=".xlsx"></label>':'')+sourceTools+'</div>'+
         '<div class="doc-grid"><div class="editor-table">'+documentTable('editor:'+type,list,itemRows,['rowNumber','rowActions',...shown.map(({section,f})=>section+':'+f.key)],{
           'body:product':220,'body:ledgerAccount':190,'body:production':125,'body:expiry':125,'body:barcode':126
-        })+'</div>'+
-        '<div class="doc-grid-summary"><strong>合计</strong><output id="doc-grid-total">'+(journal?'':'¥ '+priceSummary(editor).toFixed(2))+'</output></div></div>';
+        },gridFooter)+'</div></div>';
     } else if (sourceTools) {
       inner+='<div class="toolbar doc-tools">'+sourceTools+'</div>';
     }
     const footerPanels=[['amounts','表尾信息'],...(amounts?[['expenses',purchasing?'采购费用':'销售费用']]:[]),
       ...(shipping?[['shipping','物流与发票']]:[]),['attachments','附件']];
     const currentFooter=editor.footerTab||'amounts';
-    const panel=key=>'<section class="doc-footer-panel"'+(currentFooter===key?'':' hidden')+'>';
+    const panel=key=>'<section class="doc-footer-panel"'+(currentFooter===key||trade&&key==='amounts'?'':' hidden')+'>';
+    const settlementLabels=tradeSettlementLabels(type);
     inner+='<div class="doc-audit"><span>制单人 '+e(doc?.creatorName||state.user.name)+'</span>'+
       (doc?.created?'<span>创建时间 '+e(doc.created)+'</span>':'')+'</div>'+
       '<div class="doc-footer-tabs" aria-label="单据页脚">'+footerPanels.map(([key,title])=>
         btn(title,'doc-footer-tab',key,key===currentFooter?'primary':'')).join('')+'</div>'+panel('amounts')+
-      '<div class="form-grid">'+      (cash||fee?foot('amount',numeric('amount',stash('amount')),true):!journal?foot('discount',numeric('discount',fields.discount??1,step('discount')))+foot('reduction',numeric('reduction',stash('reduction')))+foot('freight',numeric('freight',stash('freight'))):'')+
-      (amounts?foot('advance',numeric('advance',stash('advance')))+foot('paid',numeric('paid',stash('paid'))):'')+
-      ((cash&&!['openingAR','openingAP'].includes(type)||fee||amounts)?foot('account',pickControl('account','accounts',stash('account'),'资金账户')):'')+
+      '<div class="form-grid">'+      (cash||fee?foot('amount',numeric('amount',stash('amount')),true):!journal&&!opening?(trade?'':foot('discount',numeric('discount',fields.discount??1,step('discount'))))+(trade?field('整单优惠',numeric('reduction',stash('reduction'))):foot('reduction',numeric('reduction',stash('reduction'))))+foot('freight',numeric('freight',stash('freight'))):'')+
+      (trade?field('商品合计(含税)','<output data-trade-total="gross"></output>')+
+        field(settlementLabels.due,'<output data-trade-total="total"></output>')+
+        field(settlementLabels.advance,numeric('advance',stash('advance')))+
+        field('资金账户',pickControl('account','accounts',stash('account'),'资金账户'))+
+        field(settlementLabels.paid,numeric('paid',stash('paid')))+btn(settlementLabels.full,'trade-pay-full')+
+        field('本单未结金额','<output data-trade-total="outstanding"></output>')+
+        (['purchaseOrder','salesOrder'].includes(type)?field('已执行金额',money(doc?.tradeAmounts?.executed)):''):'')+
+      (!trade&&((cash&&!['openingAR','openingAP'].includes(type))||fee)?foot('account',pickControl('account','accounts',stash('account'),settlementTypes.includes(type)?'结算账户':'资金账户',settlementTypes.includes(type)),settlementTypes.includes(type)):'')+
+      (['receipt','payment'].includes(type)?checkbox('useAdvance',fields.useAdvance,type==='receipt'?'使用预收余额':'使用预付余额'):'')+
       (type==='cashTransfer'?foot('targetAccount',pickControl('targetAccount','accounts',stash('targetAccount'),'转入账户',true),true):'')+
       (['expense','income','deferred'].includes(type)?foot('subject',pickControl('subject','expenses',stash('subject'),'费用/收入科目')):'')+'</div>';
     if (amounts) {
@@ -1700,7 +1909,7 @@ function renderDocument() {
           ['amount','paid'].includes(key)?numeric(groupField(key),row[key]):input(groupField(key),row[key]));
         return '<tr><td>'+btn('移除','sale-extra-remove',group+'|'+i,'danger')+'</td>'+cols.map(control=>'<td>'+control+'</td>').join('')+'</tr>';
       }));
-      const direction=purchasing?'付款':'收款';
+      const direction=type==='purchaseReturn'?'退款收入':type==='salesReturn'?'退款支出':purchasing?'付款':'收款';
       const expense=purchasing?'采购费用':'销售费用';
       inner+='<div class="toolbar doc-payment-tools"><strong>'+direction+'信息</strong>'+btn('添加'+direction+'账户','sale-extra','receipts')+'</div>'+
         (fields.receipts.length?extraSale('receipts',[direction+'账户','金额'],['account','amount'],{account:['accounts',direction+'账户']}):'')+
@@ -1730,14 +1939,14 @@ function renderDocument() {
   } else {
     inner='<p class="note">单据保存后进入草稿。提交审核并通过后，在单据中心记账。</p>';
   }
-  const footer=(!journal?'<output class="doc-total left" id="doc-total"></output>':'')+
-    btn('保存','doc-save','','primary')+(doc&&allow('d:'+type,'print')?btn('打印单据','print-doc',doc.id):'')+
+  const footer=btn('保存','doc-save','','primary')+(allow('d:'+type,'print')?btn('打印预览','preview-current'):'')+(doc&&allow('d:'+type,'print')?btn('打印单据','print-doc',doc.id):'')+
     (allow('d:'+type,'print')?btn('保存并打印','doc-save','print'):'')+(canSave(type)?btn('保存并新增','doc-save','again'):'');
   documentEditor.innerHTML='<div class="modal-layout"><div class="modal-main"><div class="doc-title-bar"><div class="doc-identity"><span>单据编号　'+
     e(doc?.number||'保存时生成')+'</span><span>录单时间　'+e(doc?.created||'保存时记录')+
     '</span></div><strong>'+e(label)+'</strong><div class="doc-settings">'+tabs.filter(([key])=>key!=='main'||editor.tab!=='main').map(([key,title])=>
       btn(key==='main'?'返回单据':title,'doc-tab',key,key===editor.tab?'primary':'')).join('')+'</div></div>'+inner+
     '</div><footer class="modal-foot">'+footer+btn('关闭','close-tab',editor.id)+'</footer></div>';
+  setSourceLoading(!!editor.sourceLoading);
   documentEditor.querySelector('.modal-main').scrollTop=scroll;
   updateDocumentAmounts(editor);
   const form=documentEditor.querySelector('#doc-form');
@@ -1748,15 +1957,80 @@ function renderDocument() {
     if (document.activeElement?.name==='scan') scanLine();
     else saveDocumentForm('');
   });
-  form?.addEventListener('input',()=>{
+  form?.addEventListener('input',event=>{
+    const match=trade&&event.target.name?.match(/^line\.(\d+)\.(exclusiveUnit|grossUnit|grossAmount|discountPercent|tax|quantity)$/);
+    const previousTax=match?Number(lines[Number(match[1])].tax||0):0;
     stashDocument();
+    if (trade) {
+      if (event.target.name==='documentDiscount') {
+        editor.fields.discount=1;
+        for (const row of lines) {
+          row.discount=Number(event.target.value)/100;
+          delete row.grossInput;
+        }
+      }
+      if (match) {
+        const row=lines[Number(match[1])];
+        const key=match[2];
+        const value=Number(event.target.value);
+        if (key==='tax'&&event.target.value==='') {
+          row.tax=pools.products.find(product=>product.id===Number(row.product))?.data.taxRate??0;
+        }
+        const rate=editor.taxEnabled?Number(row.tax||0):0;
+        const headerDiscount=Number(fields.discount??1);
+        if (key==='discountPercent') {
+          if (headerDiscount!==1) {
+            for (const line of lines) line.discount=Number(line.discount??1)*headerDiscount;
+            fields.discount=1;
+          }
+          row.discount=value/100;
+          delete row.grossInput;
+        } else if (key==='exclusiveUnit') {
+          row.price=value*(editor.taxInclusive?1+rate/100:1);
+          row.source='手工';
+          delete row.grossInput;
+        } else if (key==='quantity') {
+          delete row.grossInput;
+        } else {
+          if (key!=='tax') row.grossInput={key,value};
+          const discount=Number(row.discount??1)*headerDiscount;
+          const quantity=Number(row.quantity||0);
+          const price=priceFromTradeGrossInput(row.grossInput,quantity,discount,rate,editor.taxInclusive);
+          if (price!=null) {
+            row.price=price;
+            row.source='手工';
+          } else if (key==='tax'&&editor.taxInclusive) {
+            row.price=Number(row.price||0)/(1+previousTax/100)*(1+rate/100);
+          }
+        }
+      }
+    }
     updateDocumentAmounts(editor);
     scheduleDocumentCheck(editor);
   });
-  if ((sale||inbound)&&editor.tab==='main') loadPriorBalance(editor).catch(showError);
+  form?.addEventListener('keydown',event=>{
+    if (event.key!=='Enter'||event.isComposing||event.keyCode===229||
+        event.altKey||event.ctrlKey||event.metaKey||event.shiftKey) return;
+    const control=event.target;
+    const grid=control.closest('.doc-grid tbody');
+    const editable='input:not([readonly],[disabled],[type=hidden]),select:not([disabled]),textarea:not([readonly],[disabled])';
+    if (!grid||!control.matches(editable)) return;
+    event.preventDefault();
+    const cells=[...grid.querySelectorAll('td')];
+    const current=cells.indexOf(control.closest('td'));
+    for (const cell of cells.slice(current+1)) {
+      const next=cell.querySelector(editable+',button[data-act="doc-picker"]:not([disabled])');
+      if (!next) continue;
+      next.focus();
+      break;
+    }
+  });
   form?.addEventListener('change',async event=>{
-    const match=event.target.name?.match(/^line\.(\d+)\.(quantity|unit)$/);
+    const match=event.target.name?.match(costDocumentTypes.includes(type)?/^line\.(\d+)\.(quantity|unit|batch)$/:/^line\.(\d+)\.(quantity|unit)$/);
     if (match) await applyPrice(editor,Number(match[1]),form);
+    if (trade&&/^line\.\d+\.tax$/.test(event.target.name)&&event.target.value==='') {
+      event.target.value=lines[Number(event.target.name.split('.')[1])].tax;
+    }
   });
   documentEditor.querySelector('#attachment-files')?.addEventListener('change', event=>{
     const selected=Array.from(event.target.files);
@@ -1772,13 +2046,13 @@ function renderDocument() {
   });
   documentEditor.querySelector('#doc-import-file')?.addEventListener('change',async event=>{
     const file=event.target.files[0];
-    if (!file||editor.sourceLoading) return;
+    if (!file||editor.sourceLoading||editor.busy) return;
     const sourceVersion=editor.sourceVersion;
     try {
       const workbook=await excelUpload(file,200_000);
       const parsed=await api('/api/document-lines/import',{type,workbook});
       const rows=parsed.rows.map(row=>row.map(cell=>cell.trim()));
-      if (state.editor!==editor||sourceVersion!==editor.sourceVersion) return;
+      if (state.editor!==editor||editor.busy||sourceVersion!==editor.sourceVersion) return;
       const keys=rows[0]||[];
       const header=keys.some(key=>['商品编号','条码','code','barcode'].includes(key));
       const indexOf=(aliases,fallback)=>header?keys.findIndex(key=>aliases.includes(key)):fallback;
@@ -1805,37 +2079,48 @@ function renderDocument() {
         const product=matches[0];
         const unit=row[indexes.unit]||product.data.unit||'';
         if (!productUnits(product.data).has(unit)) throw Error(at+'单位与商品资料不符');
-        const tax=editor.taxEnabled?Number(product.data.taxRate??0):0;
+        const tax=!opening&&editor.taxEnabled?Number(product.data.taxRate??0):0;
         const priceHeader=keys[indexes.price];
         const factor=1+tax/100;
         let enteredPrice=Number(price);
         if (priceHeader==='含税单价'&&!editor.taxInclusive) enteredPrice/=factor;
         if (priceHeader==='不含税单价'&&editor.taxInclusive) enteredPrice*=factor;
         return {product:product.id,unit,quantity:roundDecimal(quantity,editor.precision.quantityDigits),
-          price:price?roundDecimal(enteredPrice,editor.precision.priceDigits):'',discount:1,tax};
+          price:price?roundDecimal(enteredPrice,editor.precision.priceDigits):opening?openingCost(product,unit,editor.precision.priceDigits):'',discount:1,tax};
       });
-      editor.lines.splice(insertAt,0,...added);
+      stashDocument();
+      const inserted=added.filter(row=>{
+        const product=pools.products.find(item=>item.id===row.product);
+        return !mergeReturnLine(editor,row.product,row.quantity,{unit:row.unit,factors:productUnits(product.data)});
+      });
+      editor.lines.splice(insertAt,0,...inserted);
       editor.dirty=true;
-      await Promise.all(added.map((row,index)=>row.price===''?applyPrice(editor,insertAt+index):null));
+      await Promise.all(inserted.map((row,index)=>row.price===''?applyPrice(editor,insertAt+index):null));
       if (state.editor!==editor) return;
       renderDocument();
       showSystemPrompt('已导入 '+added.length+' 行商品明细');
     } catch (error) {showError(error);}
   });
 }
+function openingCost(product,unit,digits) {
+  const factor=productUnits(product.data).get(unit)||1;
+  const cost=product.data.referenceCost!==''&&product.data.referenceCost!=null?product.data.referenceCost:product.data.purchase;
+  return roundDecimal(Number(cost||0)*factor,digits);
+}
 async function applyPrice(editor,i,form) {
+  if (editor.type==='openingStock') return;
   const row=editor.lines[i];
-  if (!row?.product||editor.fields.autoPrice===false) return;
-  const snapshot=[row.product,row.quantity,row.unit,editor.fields.partner].join('|');
+  if (!row?.product||!costDocumentTypes.includes(editor.type)&&(editor.fields.autoPrice===false||tradeTypes.includes(editor.type)&&row.source==='手工')) return;
+  const snapshot=[row.product,row.quantity,row.unit,editor.fields.warehouse,row.batch,editor.fields.partner,row.price,row.source].join('|');
   const product=editor.pools.products.find(p=>p.id===Number(row.product));
   const factor=productUnits(product?.data||{}).get(row.unit||product?.data.unit||'')||1;
-  const params={product:row.product,quantity:Number(row.quantity||0)*factor,partner:editor.fields.partner,side:families[editor.type][3],preset:editor.fields.preset||1};
+  const params={type:editor.type,warehouse:editor.fields.warehouse,unit:row.unit,batch:row.batch,product:row.product,quantity:Number(row.quantity||0)*factor,partner:editor.fields.partner,side:families[editor.type][3],preset:editor.fields.preset||1};
   try {
     const price=await api('/api/price?'+searchParams(params));
-    if (!documentTabs.has(editor.id)||editor.lines[i]!==row||snapshot!==[row.product,row.quantity,row.unit,editor.fields.partner].join('|')) return;
+    if (!documentTabs.has(editor.id)||editor.lines[i]!==row||snapshot!==[row.product,row.quantity,row.unit,editor.fields.warehouse,row.batch,editor.fields.partner,row.price,row.source].join('|')) return;
     const override=unitDetails(product.data,row.unit)?.[params.side==='supplier'?'purchase':'retail'];
-    const unitPrice=product.data.autoUnitPrice===false&&override!=null;
-    row.price=roundDecimal(unitPrice?override:price.price*factor,editor.precision.priceDigits);
+    const unitPrice=!costDocumentTypes.includes(editor.type)&&product.data.autoUnitPrice===false&&override!=null;
+    row.price=costDocumentTypes.includes(editor.type)?price.price:roundDecimal(unitPrice?override:price.price*factor,editor.precision.priceDigits);
     row.source=unitPrice?'单位价格':price.source;
     if (state.editor===editor) {
       const liveForm=documentEditor.querySelector('#doc-form')||form;
@@ -1846,18 +2131,29 @@ async function applyPrice(editor,i,form) {
 }
 async function scanLine() {
   const editor=state.editor;
+  if (!editor||editor.sourceLoading||editor.busy) return;
+  stashDocument();
   const term=documentEditor.querySelector('input[name=scan]')?.value.trim();
   if (!term) return;
   const choices=editor.pools.products;
   const exact=choices.filter(p=>p.data.barcode===term||p.code===term||p.data.unitRows?.some(unit=>unit.barcode===term));
   const matches=exact.length?exact:editor.fields.fuzzy?choices.filter(p=>[p.data.barcode,p.code,p.name].some(v=>String(v||'').toLowerCase().includes(term.toLowerCase()))):[];
   if (matches.length!==1) return showError(Error(matches.length?'匹配多个商品，请扫描完整条码':'未找到对应商品'));
+  const product=matches[0];
+  const unit=product.data.unitRows?.find(row=>row.barcode===term)?.name;
+  if (mergeReturnLine(editor,product.id,1,{unit,factors:productUnits(product.data)})) {
+    editor.dirty=true;
+    editor.fields.scan='';
+    renderDocument();
+    documentEditor.querySelector('input[name=scan]')?.focus();
+    return;
+  }
   if (editor.lines.filter(hasLineItem).length>=maxDocumentLines) return showError(Error('单据明细最多 500 行'));
   const i=hasLineItem(editor.lines.at(-1))?editor.lines.push(editor.lineDefaults())-1:editor.lines.length-1;
   editor.dirty=true;
   editor.fields.scan='';
   documentEditor.querySelector('input[name=scan]').value='';
-  await applyDocumentProduct(editor,i,matches[0],matches[0].data.unitRows?.find(unit=>unit.barcode===term)?.name);
+  await applyDocumentProduct(editor,i,product,unit);
   if (editor===state.editor) {
     renderDocument();
     documentEditor.querySelector('input[name=scan]')?.focus();
@@ -1870,7 +2166,8 @@ function documentPayload(editor) {
     data.saleExpenses=data.saleExpenses.filter(row=>Number(row.amount)||Number(row.paid));
   }
   return {id:editor.doc?.id,revision:editor.doc?.data.revision,type:editor.type,date,partner,warehouse,target,
-    department,data,lines:editor.lines.filter(hasLineItem)};
+    department,data,lines:editor.lines.filter(hasLineItem).map(({grossInput,...line})=>line),
+    ...(tradeTypes.includes(editor.type)?{amountCheck:draftTradeTotals(editor)}:{})};
 }
 
 function scheduleDocumentCheck(editor) {
@@ -1906,6 +2203,11 @@ async function saveDocumentForm(action) {
   if (!validateForm(form)) return;
   stashDocument();
   const {type}=editor;
+  if (tradeTypes.includes(type)&&Number(editor.fields.paid)>0&&!editor.fields.account) {
+    await showSystemPrompt('请选择本单收付款资金账户。');
+    documentEditor.querySelector('[data-act="doc-picker"][data-value^="account|"]')?.focus();
+    return;
+  }
   for (const control of form.querySelectorAll('[data-act="doc-picker"]')) {
     const [key,,label,required]=control.dataset.value.split('|');
     if (!required||key.startsWith('line.')) continue;
@@ -1916,9 +2218,10 @@ async function saveDocumentForm(action) {
       return;
     }
   }
-  const payload=documentPayload(editor);
+  const payload=structuredClone(documentPayload(editor));
   editor.busy=true;
   try {
+    if (isLinkedReturn(editor)) await api('/api/documents/validate',payload);
     const attachments=await Promise.all(editor.files.map(file=>new Promise((resolve,reject)=>{
       const reader=new FileReader();
       reader.onload=()=>resolve({name:file.name,content:String(reader.result).split(',')[1]});
@@ -1929,29 +2232,32 @@ async function saveDocumentForm(action) {
     if (!documentTabs.has(editor.id)) return;
     const wasActive=state.active===editor.id;
     removeTab(editor.id);
-    const savedMessage='单据已保存 · '+result.number;
+    const savedMessage='单据已保存 · '+result.number+settlementNotice(result);
     const list='d:'+type;
     pageState(list).result=null;
     for (const id of state.tabs.filter(id=>routes[id]?.kind==='docs')) pageState(id).result=null;
     if (wasActive) await openRoute(list);
     else refreshTabs();
-    if (action==='print') await printDocument(result);
+    if (action==='print'||action==='preview') await printDocument(result);
     showSystemPrompt(savedMessage);
     if (action==='again') await editDocument(type);
+    return result;
   } catch (error) {
     if (state.editor===editor) showError(error);
     else showSystemPrompt(editor.route.label+' · '+chineseMessage(error));
   } finally {editor.busy=false;}
 }
 async function openDocumentView(id,neighbors) {
+  const tabId='view:'+Number(id);
+  if (!canOpenTab(tabId)) return;
   const origin=state.active;
   const user=state.user;
   const source=pageState();
   const series=neighbors||(tabRoute(origin)?.kind==='docs'?source.result?.rows.map(row=>row.id):source.result?.documentIds)||[];
   const doc=await api('/api/documents/'+id+'?detail=1');
   if (state.user!==user||state.active!==origin) return;
-  const tabId='view:'+doc.id;
-  documentTabs.set(tabId,{kind:'document-view',route:{label:doc.number,group:families[doc.type][2],kind:'document-view'}});
+  if (!canOpenTab(tabId)) return;
+  documentTabs.set(tabId,{kind:'document-view',documentId:doc.id,route:{label:doc.number,group:families[doc.type][2],kind:'document-view'}});
   const view=pageState(tabId);
   view.detail=doc;
   if (series.length) view.neighbors=[...new Set(series)];
@@ -1961,12 +2267,15 @@ async function documentDetails(id) {
   const routeId=state.active;
   const page=pageState();
   page.selected=Number(id);
+  const request=page.detailRequest=(page.detailRequest||0)+1;
   const result=await api('/api/documents/'+id+'?detail=1');
-  if (routeId!==state.active||page.selected!==result.id) return;
+  if (routeId!==state.active||page.selected!==result.id||page.detailRequest!==request) return;
   page.detail=result;
   updateDetails(tabRoute(routeId)?.kind==='document-view'?page.detailTab||'items':result.execution?'execution':'items');
 }
 function statusOf(doc) {
+  if (doc.data?.reversalOf||doc.reversalOf) return '红冲单';
+  if (doc.reversedBy||doc.reversed) return '已红冲';
   if (doc.status==='posted') {
     const effect=families[doc.type][4];
     if (effect==='in') return '已入库';
@@ -1994,15 +2303,18 @@ function updateDetails(tab) {
   const mayGenerate=downstream&&executable&&['posted','settled'].includes(doc.status)&&canSave(downstream);
   const returnTypes=doc.type==='purchase'?['purchaseReturn','purchaseExchange']:doc.type==='sale'?['salesReturn','exchange']:[];
   const mayReturn=['posted','settled'].includes(doc.status);
-  const toolbar=(['draft','rejected'].includes(doc.status)&&canSave(doc.type,'edit')?btn('编辑','doc-edit',doc.id):'')+
-    (transitions[doc.status]||[]).filter(action=>allow('d:'+doc.type,action)&&!(execution?.state==='complete'&&action==='settle')).map(action=>btn(execution&&action==='settle'?'终止余量':actions[action],'transition',action,action==='delete'?'danger':['submit','approve','post'].includes(action)?'primary':'')).join('')+
+  const toolbar=(!doc.openingReadOnly&&['draft','rejected'].includes(doc.status)&&canSave(doc.type,'edit')?btn('编辑','doc-edit',doc.id):'')+
+    (doc.openingReadOnly||doc.reversedBy||doc.data.reversalOf?[]:transitions[doc.status]||[]).filter(action=>allow('d:'+doc.type,action)&&!(execution?.state==='complete'&&action==='settle')).map(action=>btn(execution&&action==='settle'?'终止余量':actions[action],'transition',action,action==='delete'?'danger':['submit','approve','post'].includes(action)?'primary':'')).join('')+
+    (['purchase','sale'].includes(doc.type)&&['posted','settled'].includes(doc.status)&&doc.autoSettlements?.length&&allow('d:'+doc.type,'unapprove')?
+      btn('反审核并撤销随单结算','transition','unapprove'):'')+
+    (settlementTypes.includes(doc.type)&&['posted','settled'].includes(doc.status)&&!doc.reversedBy&&!doc.data.reversalOf&&allow('d:'+doc.type,'reverse')?btn('红冲','transition','reverse','danger'):'')+
     (mayGenerate&&(!['receipt','payment'].includes(downstream)||doc.unpaid>0)?btn('生成'+families[downstream][0],'derive',doc.id):'')+
     (mayReturn?returnTypes.filter(type=>canSave(type)).map(type=>btn('生成'+families[type][0],'derive-return',type+'|'+doc.id)).join(''):'')+
     (allow('d:'+doc.type,'print')?btn('打印单据','print-doc',doc.id)+
       (doc.type==='sale'?btn('打印物流单','print-logistics',doc.id)+btn('全部条码打印','print-barcodes',doc.id):''):'');
   const tabs=[...(execution?[['execution','执行情况']]:[]),['items','商品明细'],['amounts','金额与结算'],['shipping','收货与物流'],['invoice','发票信息'],['related','关联单据'],['record','单据信息'],['history','操作日志'],['attachments','附件']];
   const info=doc.data;
-  const detailTable=(headers,rows)=>documentTable('detail:'+doc.type+':'+headers[0]+':'+headers.length,headers,rows);
+  const detailTable=(headers,rows,footer='')=>documentTable('detail:'+doc.type+':'+headers[0]+':'+headers.length,headers,rows,[],{},footer);
   const effect=families[doc.type][4];
   const progress=execution?'<div class="toolbar"><strong>'+e(executionLabels[execution.state])+'</strong></div>'+
     detailTable(['商品编号','商品名称','订购数量（基本单位）','已执行数量','剩余数量'],execution.rows.map((row,index)=>
@@ -2010,9 +2322,11 @@ function updateDetails(tab) {
     '<div class="toolbar">'+(execution.documents.length?execution.documents.map(row=>btn(row.number,'doc-details',row.id)).join(''):'<span class="note">暂无已记账的关联出入库单</span>')+'</div>':'';
   const names=doc.names||{};
   const fieldName=id=>names[id]||id||'—';
-  const amounts=[['含税金额',money(doc.total)],['整单折扣',info.discount??1],['整单优惠',money(info.reduction)],
-    ['运费',money(info.freight)],['预付款或预收款冲抵',money(info.advance)],['本单已录收付款',money(info.paid)]];
+  const tradeSettlement=doc.tradeAmounts?tradeSettlementRows(doc,fieldName):[];
+  const amounts=[...(info.settlementSource?[['来源','随单结算']]:[]),['含税金额',money(doc.total)],['整单折扣',info.discount??1],['整单优惠',money(info.reduction)],
+    ['运费',money(info.freight)],['预付款或预收款冲抵',money(info.advance)],['本单已录收付款',money(doc.recordedSettlement??info.paid)]];
   if (doc.unpaid!=null&&['posted','settled'].includes(doc.status)) amounts.push(['当前未结金额',money(doc.unpaid)]);
+  if (info.useAdvance) amounts.push(['结算方式',doc.type==='receipt'?'预收核销':'预付核销']);
   if (info.account) amounts.push(['资金账户',fieldName(info.account)]);
   if (info.targetAccount) amounts.push(['转入账户',fieldName(info.targetAccount)]);
   const receipts=info.receipts?.length?detailTable(['账户','收付款金额'],info.receipts.map(row=>cells([fieldName(row.account),money(row.amount)]))):'';
@@ -2021,10 +2335,13 @@ function updateDetails(tab) {
   const relationRows=doc.relations||[];
   const components={
     execution:progress,
-    amounts:detailTable(['项目','数值'],amounts.map(cells))+receipts+expenses,
+    amounts:detailTable(['项目','数值'],(doc.tradeAmounts?amounts.filter(([label])=>!['含税金额','整单优惠','运费','当前未结金额'].includes(label)):amounts).map(cells))+receipts+expenses,
     history:doc.history?.length?detailTable(['操作时间','操作员','动作'],doc.history.map(row=>cells([row.date,row.operator,actions[row.action]||row.action]))):empty('暂无操作日志'),
-    items:effect==='journal'?detailTable(['会计科目 ID','借方金额','贷方金额','备注'],doc.lines.map(r=>cells([r.data.ledgerAccount,money(r.data.debit),money(r.data.credit),r.data.note]))):
-      doc.lines.length?detailTable(['商品编号','商品名称','数量','单位',info.taxInclusive?'含税单价':'不含税单价','不含税金额','税额','批次号','序列号','备注'],doc.lines.map(r=>cells([r.productCode,r.productName,(r.data.enteredQuantity??r.quantity)/1000,r.data.unit,unitPrice(r).toFixed(info.precision?.priceDigits??2),money(r.net),money(r.tax),r.data.batch,(r.data.serials||[]).join('、'),r.data.note]))):
+    items:doc.tradeAmounts?detailTable(tradeColumns,doc.lines.map(row=>cells(tradeLineRow(row,info))),
+      '<tfoot>'+cells(tradeTotalRow(doc.tradeAmounts))+'</tfoot>'):doc.type==='openingStock'?detailTable(['商品编号','商品名称','单位','成本单价','期初数量','期初金额','备注'],
+      doc.lines.map(r=>cells([r.productCode,r.productName,r.data.unit,unitPrice(r).toFixed(info.precision?.priceDigits??2),
+        (r.data.enteredQuantity??r.quantity)/1000,money(r.net),r.data.note]))):effect==='journal'?detailTable(['会计科目 ID','借方金额','贷方金额','备注'],doc.lines.map(r=>cells([r.data.ledgerAccount,money(r.data.debit),money(r.data.credit),r.data.note]))):
+      doc.lines.length?detailTable(['商品编号','商品名称','数量','单位',info.taxInclusive?'含税单价':'不含税单价','不含税金额','税额','备注'],doc.lines.map(r=>cells([r.productCode,r.productName,(r.data.enteredQuantity??r.quantity)/1000,r.data.unit,unitPrice(r).toFixed(info.precision?.priceDigits??2),money(r.net),money(r.tax),r.data.note]))):
       detailTable(['金额','资金账户 ID','摘要'],[cells([money(doc.total),info.account||'—',info.summary||''])]),
     shipping:detailTable(['收货信息','寄件信息','物流公司','物流单号','物流运费'],[cells([[info.deliveryName,info.deliveryPhone,info.deliveryAddress].filter(Boolean).join(' ')||info.address||'—',info.sender||'—',fieldName(info.carrier),info.tracking||'—',info.carrierFee||'—'])]),
     invoice:detailTable(['需要开票','往来单位','含税金额'],[cells([info.invoice?'是':'否',doc.partnerName,money(doc.total)])]),
@@ -2035,31 +2352,49 @@ function updateDetails(tab) {
     attachments:doc.attachments.length?'<div class="toolbar">'+doc.attachments.map(f=>'<a class="btn" data-act="download-file" href="/api/attachments/'+f.id+'">'+e(f.name)+'</a>').join('')+'</div>':empty('暂无附件'),
     record:detailTable(['制单人' ,'经手人','部门','录单时间','日期','附加说明'],[cells([doc.creatorName,info.handler,doc.department,doc.created,doc.date,info.note])])
   };
-  panel.innerHTML='<div class="section-head"><h3>'+e(doc.number)+' <span class="badge" data-state="'+doc.status+'">'+e(statusOf(doc))+'</span></h3></div>'+
-    (viewing?detailTable(['单据类型','单据日期','往来单位','仓库','含税金额','摘要'],[cells([families[doc.type][0],doc.date,doc.partnerName,doc.warehouseName,money(doc.total),info.summary])])+pager:'')+
-    '<div class="toolbar">'+toolbar+'</div><div class="toolbar">'+tabs.map(([v,l])=>btn(l,'detail-tab',v,v===tab?'primary':'')).join('')+'</div>'+components[tab];
+  panel.innerHTML='<div class="section-head"><h3>'+e(doc.number)+' <span class="badge" data-state="'+doc.status+'">'+e(statusOf(doc))+'</span>'+(execution?' <span class="badge">执行状态：'+e(executionLabels[execution.state])+'</span>':'')+'</h3></div>'+
+    (viewing?detailTable(['单据类型','单据日期','往来单位','仓库',doc.tradeAmounts?'应结金额':'含税金额','摘要'],[cells([families[doc.type][0],doc.date,doc.partnerName,doc.warehouseName,money(doc.total),info.summary])])+pager:'')+
+    '<div class="toolbar">'+toolbar+'</div><div class="toolbar">'+tabs.map(([v,l])=>btn(l,'detail-tab',v,v===tab?'primary':'')).join('')+'</div>'+components[tab]+(tradeSettlement.length?detailTable(['结算项目','金额'],tradeSettlement.map(cells)):'');
+}
+function invalidateDocumentPages() {
+  for (const id of state.tabs) {
+    const page=pageState(id);
+    const kind=tabRoute(id)?.kind;
+    if (kind==='document-view'||kind==='docs') {
+      page.detail=null;
+      page.detailRequest=(page.detailRequest||0)+1;
+    }
+    if (kind==='docs'||kind==='report') {
+      page.result=null;
+      page.request=(page.request||0)+1;
+    }
+  }
 }
 async function changeStatus(action) {
   const page=pageState();
   if (!page.detail) return;
   const {id,number,execution}=page.detail;
   const message=execution&&action==='settle'?'确认终止订单 '+number+' 的剩余数量？':'确认'+actions[action]+' '+number+'？';
-  if (['delete','post','settle','reject','unapprove'].includes(action)&&!(await confirmAction(message))) return;
+  if (['delete','post','settle','reject','unapprove','reverse'].includes(action)&&!(await confirmAction(message))) return;
   const button=Array.from(document.querySelectorAll('#detail-area button')).find(b=>b.dataset.value===action);
   if (button) button.disabled=true;
   const route=state.active;
   try {
-    await api('/api/documents/'+id,{action});
-    showSystemPrompt('已'+actions[action]);
-    for (const tab of state.tabs.filter(tab=>routes[tab]?.kind==='docs'||routes[tab]?.kind==='report')) pageState(tab).result=null;
-    if (tabRoute(route)?.kind!=='document-view') await loadPage(route);
-    if (state.active===route) await documentDetails(id);
+    const result=await api('/api/documents/'+id,{action});
+    invalidateDocumentPages();
+    if(state.active===route){
+      if(tabRoute(route)?.kind==='docs')await loadPage(route);
+      await documentDetails(result.id);
+    }
+    showSystemPrompt((action==='reverse'?'已生成红冲单 '+result.number:'已'+actions[action])+
+      (action==='post'?settlementNotice(result):''));
   } finally {if (button) button.disabled=false;}
 }
-function print(title,html) {
+function print(title,html,className='') {
+  document.querySelector('.pt-print-root')?.remove();
   document.querySelector('.print-only')?.remove();
   const sheet=document.createElement('section');
-  sheet.className='print-only';
+  sheet.className='print-only '+className;
   sheet.innerHTML='<h1>'+e(title)+'</h1>'+html;
   document.body.append(sheet);
   window.print();
@@ -2074,6 +2409,7 @@ function printBarcodes(items) {
   print('商品条码','<div class="barcode-sheet">'+labels.join('')+'</div>');
 }
 async function printDocument(doc,mode='document') {
+  if(mode==='document')return showPrintPreview([doc.id],{api,showError,showSystemPrompt});
   const {template}=await api('/api/documents/'+doc.id+'/print-template');
   const pools=await catalog();
   if (mode==='logistics') {
@@ -2084,9 +2420,13 @@ async function printDocument(doc,mode='document') {
   }
   const label=families[doc.type][0];
   const heading=(template?.logoText?'<p>'+e(template.logoText)+'</p>':'')+'<p>'+e(doc.number)+'　'+e(doc.date)+'</p><p>往来单位　'+e(doc.partnerName||'—')+'　　仓库　'+e(doc.warehouseName||'—')+'</p>';
-  const lineTable=doc.lines.some(l=>l.product)?table(['商品编号','商品名称','数量','单位',doc.data.taxInclusive?'含税单价':'不含税单价','税额','含税金额'],doc.lines.map(l=>cells([l.productCode,l.productName,(l.data.enteredQuantity??l.quantity)/1000,l.data.unit,unitPrice(l).toFixed(doc.data.precision?.priceDigits??2),money(l.tax),money(l.net+l.tax)]))):
+  const trade=doc.tradeAmounts;
+  const lineTable=trade?table(tradeColumns,[...doc.lines.map(line=>cells(tradeLineRow(line,doc.data))),
+    cells(tradeTotalRow(trade)).replace('<tr>','<tr class="report-total">')]):doc.lines.some(l=>l.product)?table(['商品编号','商品名称','数量','单位',doc.data.taxInclusive?'含税单价':'不含税单价','税额','含税金额'],doc.lines.map(l=>cells([l.productCode,l.productName,(l.data.enteredQuantity??l.quantity)/1000,l.data.unit,unitPrice(l).toFixed(doc.data.precision?.priceDigits??2),money(l.tax),money(l.net+l.tax)]))):
     doc.lines.length?table(['科目','借方','贷方'],doc.lines.map(l=>cells([pools.ledgerAccounts.find(a=>a.id===l.data.ledgerAccount)?.name,money(l.data.debit),money(l.data.credit)]))):'';
-  print(template?.title||label,heading+lineTable+'<p>合计　¥ '+money(doc.total)+'</p><p>'+e(template?.footer||'')+'</p>');
+  const settlement=trade?table(['结算项目','金额'],tradeSettlementRows(doc,id=>pools.accounts.find(account=>account.id===id)?.name).map(cells)):
+    '<p>合计　¥ '+money(doc.total)+'</p>';
+  print(template?.title||label,heading+lineTable+settlement+'<p>'+e(template?.footer||'')+'</p>',trade?'print-trade-document':'');
 }
 function excelUpload(file,maxBytes=1_000_000) {
   if (!file||!file.name.toLowerCase().endsWith('.xlsx')) throw Error('请选择 Excel 文件（.xlsx）');
@@ -2120,11 +2460,11 @@ async function saveImport() {
 }
 async function showStatement() {
   const pools=await catalog();
-  const params=pageState().params;
+  const params={...defaultQueryDates(),...pageState().params};
   state.editor={kind:'statement',dirty:false};
   modal('生成对账链接','<form novalidate id="statement-form"><div class="form-grid">'+
     field('往来单位',select('partner',rowsToOptions(pools.partners),'','required'),true,'span2')+
-    field('开始日期',input('from',params.from,'type="date"'))+field('结束日期',input('to',params.to||currentDate(),'type="date"'))+
+    field('开始日期',input('from',params.from,'type="date"'))+field('结束日期',input('to',params.to,'type="date"'))+
     '</div><p class="note">链接保留当前对账流水，有效期 7 天。收到链接的人可以查看该对账单。</p></form>',
     btn('生成链接','statement-save','','primary'),true);
 }
@@ -2253,6 +2593,13 @@ function updateDocumentSelection(main) {
   }
   const count=main.querySelector('[data-selection-count]');
   if (count) count.textContent='已选 '+selected+' 张';
+  const selection=new Set([...main.querySelectorAll('input[name=documentSelection]:checked')].map(row=>Number(row.value)));
+  const unapprove=main.querySelector('[data-act="documents-bulk-action"][data-value="unapprove"]');
+  if (unapprove) {
+    const candidate=(pageState().result?.rows||[]).filter(row=>selection.has(row.id));
+    unapprove.disabled=!candidate.length||candidate.some(row=>row.status!=='approved'||!allow('d:'+row.type,'unapprove'));
+    unapprove.title=unapprove.disabled?'仅已审核未记账的单据可反审核，已记账收付款请使用红冲':'';
+  }
 }
 
 document.addEventListener('change',event=>{
@@ -2274,13 +2621,14 @@ async function bulkDocumentAction(action,button) {
   const invalid=ids.map(id=>records.get(id)).find(row=>row&&
     (!(transitions[row.status]||[]).includes(action)||!allow('d:'+row.type,action)));
   const label=actions[action];
-  if (invalid) return showSystemPrompt('单据 '+invalid.number+' 当前无法'+label+'，请调整所选单据。');
+  if (invalid) return showSystemPrompt(action==='unapprove'&&['posted','settled'].includes(invalid.status)&&settlementTypes.includes(invalid.type)?'已记账单据不能反审核，请使用红冲':'单据 '+invalid.number+' 当前无法'+label+'，请调整所选单据。');
   if (!await confirmAction('确定'+label+'选中的 '+ids.length+' 张单据？')) return;
   button.disabled=true;
   try {
     const {count}=await api('/api/documents/bulk-action',{ids,action});
-    for (const id of state.tabs.filter(id=>['docs','report'].includes(routes[id]?.kind))) pageState(id).result=null;
+    invalidateDocumentPages();
     if (state.active===origin) await loadPage(origin);
+    else await mount();
     void showSystemPrompt('已'+label+' '+count+' 张单据。');
   } finally {button.disabled=false;}
 }
@@ -2363,11 +2711,30 @@ const handlers={
     if (!page.requested) return renderPage(routes[state.active],page);
     return submitQuery({view});
   },
+  async 'preview-current'() {
+    const editor=state.editor;
+    if(!editor||editor.busy||editor.sourceLoading)return;
+    stashDocument();
+    const {rows}=await api('/api/print-templates?type='+editor.type);
+    const template=rows.find(row=>row.is_default)||rows[0];
+    if(template?.layout.autoSave)return saveDocumentForm('preview');
+    if(!editor.doc)return showSystemPrompt('请先保存单据，或在默认打印模板中启用「打印前自动保存」');
+    return showPrintPreview([editor.doc.id],{api,showError,showSystemPrompt,beforePrint:async()=>{
+      if(state.editor!==editor)return;
+      const result=await saveDocumentForm('');
+      if(!result)throw Error('自动保存未完成，请核对单据');
+    }});
+  },
+  'print-selected'() {
+    const ids=[...document.querySelectorAll('input[name=documentSelection]:checked')].map(node=>Number(node.value));
+    if(!ids.length)return showSystemPrompt('请先勾选需要打印的单据');
+    return showPrintPreview(ids,{api,showError,showSystemPrompt});
+  },
   'print-table'() {
     if (!routeAllows(state.active,'print')) return;
-    const node=document.querySelector('#page-main table');
-    if (!node) return showSystemPrompt('请先查询需要打印的数据');
-    print(routes[state.active].label,node.outerHTML);
+    const tables=[...document.querySelectorAll('#page-main table')];
+    if (!tables.length) return showSystemPrompt('请先查询需要打印的数据');
+    print(routes[state.active].label,tables.map(table=>table.outerHTML).join(''));
   },
   'permission-add-staff':()=>editMaster(),
   'master-edit':id=>editMaster(id),
@@ -2392,6 +2759,18 @@ const handlers={
   'derive-return'(value) {
     const [type,id]=value.split('|');
     return editDocument(type,null,id);
+  },
+  'trade-pay-full'() {
+    const editor=state.editor;
+    if (!editor||editor.busy||editor.sourceLoading) return;
+    stashDocument();
+    const other=[editor.fields.advance,...(editor.fields.receipts||[]).map(row=>row.amount)]
+      .reduce((sum,value)=>sum+Math.round(Number(value||0)*100),0);
+    editor.fields.paid=money(Math.max(0,Math.abs(draftTradeTotals(editor).total)-other));
+    documentEditor.querySelector('[name="paid"]').value=editor.fields.paid;
+    editor.dirty=true;
+    updateDocumentAmounts(editor);
+    scheduleDocumentCheck(editor);
   },
   'doc-footer-tab'(tab) {
     stashDocument();state.editor.footerTab=tab;renderDocument();
@@ -2432,15 +2811,17 @@ const handlers={
   'print-logistics':async id=>printDocument(await api('/api/documents/'+id),'logistics'),
   'print-barcodes':async id=>printDocument(await api('/api/documents/'+id),'barcodes'),
   'line-add'(value) {
-    stashDocument();
     const editor=state.editor;
+    if (!editor||editor.sourceLoading||editor.busy) return;
+    stashDocument();
     if (editor.lines.length>=maxDocumentLines) return showError(Error('单据明细最多 500 行'));
-    const index=value===''?editor.lines.length-1:Math.min(Number(value)+1,editor.lines.length-1);
+    const index=value===''?Math.max(0,editor.lines.length-1):Number(value)+1;
     editor.lines.splice(index,0,editor.lineDefaults());
     renderDocument();
     documentEditor.querySelector('[data-value^="line.'+index+'."][data-act="doc-picker"]')?.focus();
   },
   'line-remove'(value) {
+    if (!state.editor||state.editor.sourceLoading||state.editor.busy) return;
     stashDocument();state.editor.lines.splice(Number(value),1);state.editor.dirty=true;renderDocument();
   },
   'parse-address'() {

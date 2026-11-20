@@ -13,6 +13,7 @@ test('备份可下载且完整；重建要求管理员确认，保留重建前�
   const path=join(root,'current.sqlite');
   const password='Test-Inventory-2026';
   const {server,store}=createApp({path,password,demo:true});
+  store.run('DELETE FROM opening_state');
   t.after(()=>{
     store.db.close();
     rmSync(root,{recursive:true,force:true});

@@ -1,17 +1,17 @@
-import { families, masters, reports } from './catalog.js';
+import { families, masters, reports, settlementTypes } from './catalog.js';
 
 export const permissionLabels = {
-  view:'查看',create:'新增',edit:'编辑',master:'维护',import:'导入',export:'导出',print:'打印',
-  submit:'提交审核',approve:'审核通过',unapprove:'反审核',reject:'驳回',post:'记账',settle:'结算／终止',
+  view:'查看',create:'新增',edit:'编辑',master:'维护',import:'导入',export:'导出',print:'单据打印',design:'打印模板设计',reprint:'重复打印',
+  submit:'提交审核',approve:'审核通过',unapprove:'反审核',reject:'驳回',post:'记账',reverse:'红冲',settle:'结算／终止',
   stop:'截停',delete:'删除',restore:'恢复',share:'生成对账链接'
 };
-const documentActions=['view','create','edit','submit','approve','unapprove','reject','post','settle','stop','delete','restore','export','print'];
+const documentActions=['view','create','edit','submit','approve','unapprove','reject','post','settle','stop','delete','restore','export','print','reprint'];
 const administratorModules=new Set(['m:users','m:settings','r:系统日志']);
 export const permissionModules=[
   ...Object.entries(masters).filter(([key])=>!administratorModules.has('m:'+key)).map(([key,[label,group]])=>({
-    id:'m:'+key,label,group,actions:['view','master',...(['products','partners'].includes(key)?['import']:[]),'export','print']
+    id:'m:'+key,label,group,actions:['view','master',...(key==='templates'?['design']:[]),...(['products','partners'].includes(key)?['import']:[]),'export','print']
   })),
-  ...Object.entries(families).map(([key,[label,,group]])=>({id:'d:'+key,label,group,actions:documentActions})),
+  ...Object.entries(families).map(([key,[label,,group]])=>({id:'d:'+key,label,group,actions:settlementTypes.includes(key)?[...documentActions,'reverse']:documentActions})),
   ...Object.entries(reports).flatMap(([group,names])=>names.filter(name=>!administratorModules.has('r:'+name)).map(label=>({
     id:'r:'+label,label,group,actions:['view','export','print',...(label==='对账'?['share']:[])]
   })))
@@ -19,7 +19,7 @@ export const permissionModules=[
 const restrictedByDefault=new Set(['m:owners','m:templates','m:printers']);
 const byId=new Map(permissionModules.map(module=>[module.id,module]));
 const legacyClerk=new Set(['create','edit','master','import','submit','stop','delete','restore','share']);
-const legacyReviewer=new Set(['approve','unapprove','reject','stop','post','settle']);
+const legacyReviewer=new Set(['approve','unapprove','reject','stop','post','settle','reverse']);
 
 export function permits(user,module,action='view') {
   if (!user) return false;

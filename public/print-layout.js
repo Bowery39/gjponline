@@ -18,12 +18,35 @@ export const paperPresets={A4:[210,297],A5:[148,210],'241×93':[241,93],'241×14
 export const escapePrint=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const clone=value=>JSON.parse(JSON.stringify(value));
 const moneyFields=new Set(['baseAmount','net','tax','gross','reduction','freight','total','paid','outstanding','balance','unitPrice','discountedUnit','grossUnit','debit','credit']);
+export const printNumber=value=>Math.round((value+Number.EPSILON)*10)/10;
+export function normalizePrintTemplate(input) {
+  const value=clone(input),layout=value?.layout;
+  if(!layout)return value;
+  // Split the historical full-width signature label before arranging it.
+  const ids=new Set((layout.elements||[]).map(el=>el.id));
+  layout.elements=(layout.elements||[]).flatMap(el=>{
+    if(el.id!=='sign'||el.kind!=='text'||!['制单','审核','收货人'].every(label=>el.text?.includes(label)))return [el];
+    const scale=el.w/190;
+    return [['sign','制单：',0,12],['sign-audit','审核：',64,12],['sign-recipient','收货人：',128,18]]
+      .filter(([id])=>id==='sign'||!ids.has(id)).map(([id,text,x,w])=>({...el,id,text,x:el.x+x*scale,w:w*scale}));
+  });
+  const round=(object,key,positive=false)=>{const n=object?.[key];if(typeof n==='number'&&Number.isFinite(n)&&n>=0)object[key]=positive&&n>0?Math.max(0.1,printNumber(n)):printNumber(n);};
+  for(const key of ['width','height'])round(value.paper,key);
+  for(const key of ['top','right','bottom','left'])round(value.paper?.margin,key);
+  for(const el of layout.elements)for(const key of ['x','y','w','h','fontSize','lineWidth'])round(el,key,['w','h','lineWidth'].includes(key));
+  for(const key of printBands)round(layout.bands,key);
+  for(const c of layout.table?.columns||[])round(c,'width',true);
+  const columns=layout.table?.columns?.filter(c=>c.visible!==false)||[],width=value.paper?.width-value.paper?.margin?.left-value.paper?.margin?.right;
+  const sum=columns.reduce((total,c)=>total+c.width,0),last=columns.at(-1);
+  if(last&&sum>width&&sum-width<1&&last.width-(sum-width)>=3)last.width=printNumber(last.width-(sum-width));
+  return value;
+}
 export function defaultPrintTemplate(type) {
   const cash=families[type]?.[4]==='cash',journal=families[type]?.[4]==='journal';
   const keys=cash?['index','name','gross']:journal?['index','ledgerAccount','debit','credit']:['index','code','name','unit','quantity','unitPrice','gross'];
   const widths=cash?[10,120,60]:journal?[10,90,45,45]:[10,30,50,12,20,28,40];
   const field=(id,band,key,x,y,w,h=6)=>({id,kind:'field',band,key,x,y,w,h,font:'Microsoft YaHei',fontSize:10,align:'left',decimals:2,wrap:true});
-  return {doc_type:type,name:'系统默认',is_default:true,
+  return normalizePrintTemplate({doc_type:type,name:'系统默认',is_default:true,
     paper:{preset:'A4',width:210,height:297,orientation:'portrait',margin:{top:10,right:10,bottom:10,left:10}},
     layout:{version:1,bands:{pageHeader:15,header:30,body:175,footer:40,pageFooter:10},
       elements:[{...field('company','pageHeader','companyName',0,0,190,8),fontSize:16,bold:true,align:'center'},
@@ -36,7 +59,7 @@ export function defaultPrintTemplate(type) {
         {...field('page','pageFooter','page',0,0,190),align:'center'}],
       table:{columns:keys.map((key,i)=>({key,title:printLineFields[key],width:widths[i],visible:true,decimals:key==='index'?0:2,align:moneyFields.has(key)||key==='quantity'?'right':'left'})),
         rowHeight:6,headerHeight:7,rowsPerPage:0,fillBlank:true,subtotal:true,total:true},
-      grid:2,snap:true,overlay:false,background:null,requireApproved:false,autoSave:false}};
+      grid:2,snap:true,overlay:false,background:null,requireApproved:false,autoSave:false}});
 }
 function fail(message) {throw Error(message);}
 const finite=(value,min,max)=>typeof value==='number'&&Number.isFinite(value)&&value>=min&&value<=max;
@@ -64,6 +87,9 @@ export function validatePrintTemplate(value) {
     if (el.align!=null&&!['left','center','right'].includes(el.align)) fail('对齐方式无效');
     for (const key of ['text','expression']) if (el[key]!=null&&(typeof el[key]!=='string'||el[key].length>1000)) fail('文本或表达式过长');
     if (el.kind==='expression') evaluatePrintExpression(el.expression||'0',{});
+    if(el.lineWidth!=null&&!finite(el.lineWidth,0.01,10))fail('线宽须为0.01–10mm');
+    if(el.lineStyle!=null&&!['solid','dashed','dotted'].includes(el.lineStyle))fail('线型无效');
+    if(el.color!=null&&(typeof el.color!=='string'||!/^#[0-9a-fA-F]{6}$/.test(el.color)))fail('颜色须为六位十六进制颜色');
     validateFormat(el);
     if (el.asset!=null&&!/^[a-f0-9]{64}$/.test(el.asset)) fail('图片编号无效');
   }
@@ -183,9 +209,19 @@ export function paginatePrint(template,data) {
   return pages.map((page,index)=>({...page,index:index+1,count:pages.length,last:index===pages.length-1,
     totals,fields:{...data.fields,page:'第 '+(index+1)+' 页 / 共 '+pages.length+' 页',uppercase:uppercaseRmb(Math.round(Number(data.fields.total||0)*100))}}));
 }
+export const shapePrintStyle=el=>(el.kind==='line'?'border-top:':'border:')+(el.lineWidth??0.2)+'mm '+(el.lineStyle||'solid')+' '+(el.color||'#222222')+';';
 const styleOf=el=>'font-family:'+escapePrint(el.font||'Microsoft YaHei')+';font-size:'+(el.fontSize||10)+'pt;font-weight:'+(el.bold?'700':'400')+
   ';text-align:'+(el.align||'left')+';white-space:'+(el.wrap===false?'nowrap':'pre-wrap')+';border:'+(el.border?'0.2mm solid #111':'0')+';';
-export function renderPrintPages(template,data,{preview=true,pageMargins=false}={}) {
+const symbolCache=new Map();let symbolBuilds=0;
+export function cachedPrintSymbol(kind,value,build) {
+  const key=kind+':'+String(value);
+  if(symbolCache.has(key))return symbolCache.get(key);
+  const result=build();symbolBuilds++;
+  if(symbolCache.size>=256)symbolCache.delete(symbolCache.keys().next().value);
+  symbolCache.set(key,result);return result;
+}
+export const printSymbolCacheInfo=()=>({size:symbolCache.size,builds:symbolBuilds});
+export function renderPrintPages(template,data,{preview=true,pageMargins=false,pageIndex=null}={}) {
   const p=template.paper,l=template.layout;
   const left=pageMargins?0:p.margin.left,top=pageMargins?0:p.margin.top;
   const pageWidth=pageMargins?p.width-p.margin.left-p.margin.right:p.width;
@@ -193,7 +229,7 @@ export function renderPrintPages(template,data,{preview=true,pageMargins=false}=
   const offsets={};let y=top;
   for(const band of printBands){offsets[band]=y;y+=l.bands[band];}
   const pages=paginatePrint(template,data);
-  return pages.map(page=>{
+  return pages.filter((_,index)=>pageIndex==null||index===pageIndex).map(page=>{
     const elements=l.elements.filter(el=>el.band!=='header'||page.index===1).filter(el=>el.band!=='footer'||page.last);
     const markup=elements.map(el=>{
       const key=el.key||'',value=el.kind==='expression'?evaluatePrintExpression(el.expression||'0',page.fields):
@@ -201,15 +237,15 @@ export function renderPrintPages(template,data,{preview=true,pageMargins=false}=
       let html=escapePrint(formatPrintValue(value,el,key));
       if(el.kind==='image')html=el.asset?'<img alt="" src="/api/print-assets/'+el.asset+'">':'';
       if(el.kind==='barcode') {
-        const bars=code39(String(value||''));
+        const bars=cachedPrintSymbol('barcode',value,()=>code39(String(value||'')));
         if(!bars)html='<span>条码内容不支持</span>';
         else {let x=0;const rects=bars.map((w,i)=>{const rect=i%2?'':'<rect x="'+x+'" y="0" width="'+w+'" height="30"/>';x+=w;return rect;}).join('');
           html='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 '+x+' 36" preserveAspectRatio="none">'+rects+'<text x="'+x/2+'" y="35" text-anchor="middle" font-size="5">'+escapePrint(value)+'</text></svg>';}
       }
-      if(el.kind==='qr'){try{html=qrSvg(String(value||''));}catch{html='二维码内容过长';}}
+      if(el.kind==='qr'){try{html=cachedPrintSymbol('qr',value,()=>qrSvg(String(value||'')));}catch{html='二维码内容过长';}}
       if(el.kind==='line'||el.kind==='rect')html='';
       return '<div class="pt-element" style="left:'+(left+el.x)+'mm;top:'+(offsets[el.band]+el.y)+'mm;width:'+el.w+'mm;height:'+el.h+'mm;'+styleOf(el)+
-        (el.kind==='line'?'border-top:0.2mm solid #111;':'')+(el.kind==='rect'?'border:0.2mm solid #111;':'')+'">'+html+'</div>';
+        (['line','rect'].includes(el.kind)?shapePrintStyle(el):'')+'">'+html+'</div>';
     }).join('');
     const columns=l.table.columns.filter(c=>c.visible!==false);
     const cells=(row,totalLabel)=>{

@@ -105,8 +105,8 @@ test('适配按比例调整区域和位置，正文至少9pt标题至少12pt，�
   const paper=selectPrintPaper(template.paper,{preset:'241×140'});
   fitPrintPaper(template,paper);
   const ratio=120/277;
-  assert.ok(Math.abs(template.layout.bands.header-original.layout.bands.header*ratio)<1e-9);
-  assert.ok(Math.abs(template.layout.elements[2].x-original.layout.elements[2].x*221/190)<1e-9);
+  assert.ok(template.layout.bands.header>=Math.round(original.layout.bands.header*ratio*10)/10); // collision resolution may expand the header
+  assert.equal(template.layout.elements[3].x,Math.round(original.layout.elements[3].x*221/190*10)/10);
   for(const element of template.layout.elements)assert.ok(element.fontSize>=(['title','company'].includes(element.id)?12:9));
   validatePrintTemplate(template);
   const kept=structuredClone(original);fitPrintPaper(kept,paper,{keepFontSize:true});

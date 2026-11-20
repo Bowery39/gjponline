@@ -755,3 +755,9 @@ dialog.small{width:500px}
 .pt-design-band.active {border-color:#2861ea;box-shadow:inset 0 0 0 1px #2861ea33}
 #pt-paper-status {display:block;color:#315d86;font-size:12px}
 .pt-name-dialog output {display:block;color:#b42318}
+
+.pt-toast {position:fixed;z-index:2147483647;top:22px;left:50%;transform:translateX(-50%);max-width:80vw;padding:10px 18px;background:#245b85;color:#fff;box-shadow:0 3px 12px #0003;border-radius:5px;pointer-events:none;font-size:14px}
+.pt-form-error {display:block;color:#b42318;white-space:normal;font-size:12px;margin-top:6px}
+.pt-drag-ghost {position:fixed;z-index:2147483646;pointer-events:none;padding:5px 9px;background:#e4f0ff;border:1px solid #2861ea;color:#214875;font-size:13px}
+
+.pt-insert-options {display:flex;gap:6px;flex-wrap:wrap;width:100%;padding:5px;background:#fff8d8;border:1px solid #dfcb89}

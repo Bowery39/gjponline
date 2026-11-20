@@ -1,7 +1,7 @@
 import {createHash} from 'node:crypto';
 import {families} from '../public/catalog.js';
 import {permits} from '../public/permissions.js';
-import {defaultPrintTemplate,validatePrintTemplate,paginatePrint} from '../public/print-layout.js';
+import {defaultPrintTemplate,validatePrintTemplate,paginatePrint,normalizePrintTemplate} from '../public/print-layout.js';
 import {storedTradeLine,tradeLineSign} from '../public/system-settings.js';
 import {getDocument,check,parse,log} from './engine.js';
 import {getSystemSettings} from './system-settings.js';
@@ -34,7 +34,8 @@ export function initializePrintTemplates(s) {
 }
 const map=row=>{
   const paper=parse(row.paper);paper.orientation=paper.width>paper.height?'landscape':'portrait';
-  return {...row,paper,layout:parse(row.layout_json),is_default:!!row.is_default,is_system:!!row.is_system};
+  const {layout_json,...metadata}=row;
+  return normalizePrintTemplate({...metadata,version:row.revision,paper,layout:parse(layout_json),is_default:!!row.is_default,is_system:!!row.is_system});
 };
 const designer=user=>check(permits(user,'m:templates','design'),'没有打印模板设计权限',403);
 export function listPrintTemplates(s,user,type) {
@@ -60,17 +61,19 @@ function validateAssets(s,value) {
 export function savePrintTemplate(s,user,input) {
   designer(user);
   let value;
-  try {value=validatePrintTemplate(input);}catch(error){check(false,error.message);}
+  try {value=validatePrintTemplate(normalizePrintTemplate(input));}catch(error){check(false,error.message);}
   return s.tx(()=>{
     const current=input.id?s.one('SELECT * FROM print_templates WHERE id=?',Number(input.id)):null;
     check(!input.id||current,'模板不存在',404);
     if(current) {
-      check(input.revision===current.revision,'模板已被其他人修改，请刷新后重试',409);
+      if((input.revision??input.version)!==current.revision)throw Object.assign(Error('模板已被其他人修改，请刷新后重试'),{status:409,code:'TEMPLATE_VERSION_CONFLICT',field:'revision'});
       check(current.doc_type===value.doc_type,'不能更改单据类型');
       check(!current.is_default||value.is_default,'请先将其他模板设为默认',409);
     }
-    check(!s.one('SELECT id FROM print_templates WHERE doc_type=? AND name=? AND id<>?',value.doc_type,value.name.trim(),current?.id||0),'同类单据的模板名称已存在',409);
+    if(s.one('SELECT id FROM print_templates WHERE doc_type=? AND name=? AND id<>?',value.doc_type,value.name.trim(),current?.id||0))
+      throw Object.assign(Error('同类单据的模板名称已存在'),{status:409,code:'TEMPLATE_NAME_CONFLICT',field:'name'});
     validateAssets(s,value);
+    if(current){const previous=map(current);if(previous.name===value.name.trim()&&previous.is_default===value.is_default&&JSON.stringify(previous.paper)===JSON.stringify(value.paper)&&JSON.stringify(previous.layout)===JSON.stringify(value.layout))return previous;}
     if(value.is_default)s.run('UPDATE print_templates SET is_default=0,revision=revision+1 WHERE doc_type=? AND is_default=1 AND id<>?',value.doc_type,current?.id||0);
     const now=new Date().toISOString();
     let id=current?.id;
@@ -134,6 +137,7 @@ export function importPrintTemplate(s,user,input) {
   });
 }
 function savePrintTemplateWithin(s,user,value,replace) {
+  value=normalizePrintTemplate(value);
   // Save uses a transaction; SQLite savepoints preserve the outer JSON import transaction.
   s.db.exec('SAVEPOINT template_import');
   try {

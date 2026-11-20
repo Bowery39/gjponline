@@ -26,6 +26,7 @@ import { families, masters, statusNames, relatedDocuments, submittedSources, ord
 const digest = token => createHash('sha256').update(token).digest('hex');
 const lifetime = 12*60*60*1000;
 const files = {
+  '/print-editor.js':['print-editor.js','text/javascript; charset=utf-8'],
   '/print-output.js':['print-output.js','text/javascript; charset=utf-8'],
   '/print-layout.js':['print-layout.js','text/javascript; charset=utf-8'],
   '/print-qr.js':['print-qr.js','text/javascript; charset=utf-8'],
@@ -445,7 +446,7 @@ function seedDocumentChoices(s,includeDocuments) {
     transition(s,actor,doc.id,'submit');
   }
 }
-export function createApp({path=':memory:', password, demo=false, demoDocuments=false, secure=false, backupDirectory}={}) {
+export function createApp({path=':memory:', password, demo=false, demoDocuments=false, secure=false, backupDirectory, printTimingLogger=entry=>console.info(JSON.stringify(entry))}={}) {
   if (path!==':memory:') mkdirSync(dirname(resolve(path)),{recursive:true});
   const s=openDatabase(path);
   if (!s.one('SELECT id FROM users LIMIT 1')) {
@@ -462,6 +463,7 @@ export function createApp({path=':memory:', password, demo=false, demoDocuments=
   const attempts=new Map();
   const server=createServer(async(req,res)=>{
     let authenticatedToken;
+    const started=performance.now(),timed=/^\/api\/(?:print-templates|print\/preview)(?:[/?]|$)/.test(req.url);
     const body=async(req,limit)=>{
       const input=await readRequestBody(req,limit);
       if (authenticatedToken)
@@ -471,8 +473,10 @@ export function createApp({path=':memory:', password, demo=false, demoDocuments=
     const sendError=(status,message,code='REQUEST_FAILED',field=null,extra={})=>
       send({error:message,code,message,field,...extra},status);
     const send=(data,status=200)=>{
+      const json=JSON.stringify(data);
+      if(timed){const duration=Math.round((performance.now()-started)*10)/10;res.setHeader('Server-Timing','print;dur='+duration);printTimingLogger?.({event:'print_api',method:req.method,path:req.url.split('?')[0],status,duration_ms:duration});}
       res.writeHead(status,{'Content-Type':'application/json; charset=utf-8'});
-      res.end(JSON.stringify(data));
+      res.end(json);
     };
     const sendExcel=(columns,rows)=>{
       const workbook=xlsx(columns,rows);
@@ -493,7 +497,7 @@ export function createApp({path=':memory:', password, demo=false, demoDocuments=
         res.writeHead(200,{'Content-Type':contentType});
         return res.end(readFileSync(new URL('../public/'+file,import.meta.url)));
       }
-      if (method==='POST') {
+      if (method==='POST'||method==='PUT') {
         const origin=req.headers.origin;
         check(!origin || new URL(origin).host===req.headers.host,'请求来源无效',403);
         check(req.headers['content-type']?.startsWith('application/json'),'请提交 JSON 请求',415);
@@ -595,9 +599,13 @@ export function createApp({path=':memory:', password, demo=false, demoDocuments=
         return res.end(output);
       }
       const templateRoute=route.match(/^\/api\/print-templates\/(\d+)$/);
+      if(templateRoute&&method==='PUT') return send(savePrintTemplate(s,user,{...await body(req,3_000_000),id:Number(templateRoute[1])}));
       if(templateRoute&&method==='GET') return send(getPrintTemplate(s,user,templateRoute[1]));
       if(templateRoute&&method==='POST') return send(changePrintTemplate(s,user,templateRoute[1],await body(req)));
-      if(route==='/api/print/preview'&&method==='POST') return send({documents:preparePrint(s,user,await body(req),{enforce:false})});
+      if(route==='/api/print/preview'&&method==='POST') {
+        const documents=preparePrint(s,user,await body(req),{enforce:false});
+        return send({documents,templates:Object.fromEntries([...new Set(documents.map(row=>row.data.type))].map(type=>[type,listPrintTemplates(s,user,type)]))});
+      }
       if(route==='/api/print/commit'&&method==='POST') return send(recordPrint(s,user,await body(req)));
       if(route==='/api/print/excel'&&method==='POST') {
         const values=preparePrint(s,user,await body(req));

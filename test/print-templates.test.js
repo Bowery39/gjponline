@@ -14,9 +14,9 @@ import {permits} from '../public/permissions.js';
 import {readWorkbookRows} from '../src/xlsx-import.js';
 
 const password='Print-Template-2026';
-function request(server,url,{data,cookie}={}) {
+function request(server,url,{data,cookie,method}={}) {
   const req=Readable.from(data===undefined?[]:[Buffer.from(JSON.stringify(data))]);
-  Object.assign(req,{url,method:data===undefined?'GET':'POST',headers:{cookie,'content-type':'application/json'},socket:{remoteAddress:'test'}});
+  Object.assign(req,{url,method:method||(data===undefined?'GET':'POST'),headers:{cookie,'content-type':'application/json'},socket:{remoteAddress:'test'}});
   return new Promise(resolve=>{
     const headers={};const response={headersSent:false,status:200,
       setHeader:(key,value)=>{headers[key.toLowerCase()]=value;},
@@ -25,8 +25,8 @@ function request(server,url,{data,cookie}={}) {
     server.emit('request',req,response);
   });
 }
-function fixture(t) {
-  const {server,store:s}=createApp({password,demo:true});t.after(()=>s.db.close());
+function fixture(t,options={}) {
+  const {server,store:s}=createApp({password,demo:true,...options});t.after(()=>s.db.close());
   const user=s.one("SELECT * FROM users WHERE role='admin'");
   const id=code=>s.one('SELECT id FROM master WHERE code=?',code).id;
   saveOpening(s,user,'stock',{revision:openingState(s).revision,warehouse:id('WH-01'),rows:[{id:id('P-1001'),quantity:100,price:20}]});
@@ -192,4 +192,50 @@ test('批量打印按每单所选模板分页，失败不写入部分记录，�
   assert.equal(preparePrint(s,user,input)[0].data.fields.printCount,1);
   s.run("INSERT INTO ledger(doc,entity,category,amount,reference,date) VALUES(?,?,'ar',?,?,?)",doc.id,doc.partner,43210,doc.id,doc.date);
   assert.equal(preparePrint(s,user,input)[0].data.fields.balance,432.1);
+});
+
+
+test('PUT 模板保存支持 version，区分409原因，快速保存和预览不重复请求模板目录',async t=>{
+  const {server,s,user,doc}=fixture(t);
+  const login=await request(server,'/api/login',{data:{username:'admin',password}});
+  const cookie=login.headers['set-cookie'].split(';')[0];
+  const template=listPrintTemplates(s,user,'sale')[0];
+  const payload={...template,name:'PUT测试模板',version:template.revision};delete payload.revision;
+  const started=performance.now();
+  const result=await request(server,'/api/print-templates/'+template.id,{cookie,method:'PUT',data:payload});
+  assert.equal(result.status,200);assert.equal(result.json().version,template.revision+1);
+  assert.ok(performance.now()-started<1000,'本地保存应小于1秒');
+  const conflict=await request(server,'/api/print-templates/'+template.id,{cookie,method:'PUT',data:payload});
+  assert.equal(conflict.status,409);assert.equal(conflict.json().code,'TEMPLATE_VERSION_CONFLICT');assert.equal(conflict.json().field,'revision');
+  const other=changePrintTemplate(s,user,template.id,{action:'copy',name:'另一个模板'});
+  const duplicate=await request(server,'/api/print-templates/'+other.id,{cookie,method:'PUT',data:{...other,name:payload.name}});
+  assert.equal(duplicate.status,409);assert.equal(duplicate.json().code,'TEMPLATE_NAME_CONFLICT');assert.equal(duplicate.json().field,'name');
+  const previewStarted=performance.now();
+  const preview=await request(server,'/api/print/preview',{cookie,data:{ids:[doc.id]}});
+  assert.equal(preview.status,200);assert.ok(preview.json().templates.sale.some(row=>row.id===template.id));
+  assert.ok(performance.now()-previewStarted<2000,'本地30行预览应小于2秒');
+  assert.equal((await request(server,'/print-editor.js')).status,200);
+});
+
+
+test('历史数据GET/PUT统一0.1，幂等保存不增加版本，关键接口记录状态和耗时',async t=>{
+  const timings=[];const {server,s,user,doc}=fixture(t,{printTimingLogger:entry=>timings.push(entry)});
+  const original=listPrintTemplates(s,user,'sale')[0];const layout=structuredClone(original.layout);
+  Object.assign(layout.elements.find(el=>el.id==='no'),{x:21.599999999999998,fontSize:10.11111});
+  layout.bands.header=30.222222222;
+  s.run('UPDATE print_templates SET layout_json=? WHERE id=?',JSON.stringify(layout),original.id);
+  const login=await request(server,'/api/login',{data:{username:'admin',password}}),cookie=login.headers['set-cookie'].split(';')[0];
+  const loaded=await request(server,'/api/print-templates/'+original.id,{cookie});
+  assert.equal(loaded.status,200);assert.equal(loaded.json().layout.elements.find(el=>el.id==='no').x,21.6);
+  assert.equal(loaded.json().layout.bands.header,30.2);assert.match(loaded.headers['server-timing'],/print;dur=/);
+  const payload=loaded.json();payload.layout.elements.find(el=>el.id==='no').x=22.222222;
+  const saved=await request(server,'/api/print-templates/'+original.id,{cookie,method:'PUT',data:payload});
+  assert.equal(saved.status,200);assert.equal(saved.json().layout.elements.find(el=>el.id==='no').x,22.2);
+  const repeated=await request(server,'/api/print-templates/'+original.id,{cookie,method:'PUT',data:saved.json()});
+  assert.equal(repeated.status,200);assert.equal(repeated.json().revision,saved.json().revision);
+  await request(server,'/api/print-templates/'+original.id,{cookie,method:'PUT',data:payload});
+  await request(server,'/api/print/preview',{cookie,data:{ids:[doc.id]}});
+  assert.ok(timings.some(row=>row.status===409&&row.method==='PUT'));
+  assert.ok(timings.some(row=>row.path==='/api/print/preview'&&row.status===200));
+  assert.ok(timings.every(row=>Number.isFinite(row.duration_ms)&&row.duration_ms>=0));
 });

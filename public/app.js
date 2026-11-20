@@ -102,10 +102,10 @@ const empty=message=>'<div class="empty">'+e(message)+'</div>';
 const skeleton=()=>'<div class="skeleton" aria-label="正在查询">'+Array(5).fill('<i></i>').join('')+'</div>';
 const exportLink=(base,params)=>'<a class="btn" data-act="download-file" href="'+e(base+'?'+searchParams({...params,export:'1'}))+'">导出 Excel</a>';
 const menu=(text,buttons)=>'<details class="details-menu"><summary class="btn">'+e(text)+' ⌄</summary><div class="menu-list">'+buttons.join('')+'</div></details>';
-async function api(path,values,binary=false) {
+async function api(path,values,binary=false,method='POST') {
   let response;
   try {
-    response=await fetch(path,values===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(values)});
+    response=await fetch(path,values===undefined?{}:{method,headers:{'Content-Type':'application/json'},body:JSON.stringify(values)});
   } catch {
     throw Error('无法连接系统，请检查网络后重试。');
   }
@@ -113,7 +113,7 @@ async function api(path,values,binary=false) {
   const data=await response.json().catch(()=>{throw Error('系统暂时无法响应，请稍后重试。');});
   if (!response.ok) {
     if (response.status===401&&state.user) {state.user=null;showLogin();}
-    throw Object.assign(Error(data.message||data.error||'请求失败'),{code:data.code,field:data.field,documentId:data.documentId});
+    throw Object.assign(Error(data.message||data.error||'请求失败'),{status:response.status,code:data.code,field:data.field,documentId:data.documentId});
   }
   return data;
 }

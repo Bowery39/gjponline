@@ -1,5 +1,6 @@
 import {createHash} from 'node:crypto';
 import {families} from '../public/catalog.js';
+import {scope} from './reports.js';
 import {permits} from '../public/permissions.js';
 import {defaultPrintTemplate,validatePrintTemplate,paginatePrint,normalizePrintTemplate} from '../public/print-layout.js';
 import {storedTradeLine,tradeLineSign} from '../public/system-settings.js';
@@ -196,13 +197,21 @@ export function printDocumentData(s,user,id) {
   fields.uppercase='';
   return {id:doc.id,type:doc.type,status:doc.status,fields,lines};
 }
-export function preparePrint(s,user,{ids,templateId,templates={}},{enforce=true}={}) {
+export function latestPrintDocumentId(s,user,type) {
+  check(typeof type==='string'&&Object.hasOwn(families,type),'未知单据类型');
+  check(permits(user,'d:'+type,'view')&&permits(user,'d:'+type,'print'),'没有此单据的打印权限',403);
+  const visibility=scope(user);
+  const row=s.one("SELECT d.id FROM documents d WHERE "+visibility.sql+" AND d.type=? AND d.status!='deleted' ORDER BY d.id DESC LIMIT 1",...visibility.args,type);
+  check(row,'请先保存一张此类型单据，再预览真实数据',404);return row.id;
+}
+export function preparePrint(s,user,{ids,templateId,templates={}},{enforce=true,includePages=true}={}) {
   check(Array.isArray(ids)&&ids.length>0&&ids.length<=100&&ids.every(Number.isSafeInteger)&&new Set(ids).size===ids.length,'请选择 1–100 张不同单据');
   return ids.map(id=>{
     const data=printDocumentData(s,user,id),template=getPrintTemplate(s,user,templates[data.type]||templateId,data.type);
     check(!enforce||!template.layout.requireApproved||['approved','posted','settled'].includes(data.status),'未审核单据不允许打印：'+data.fields.number,409);
     check(!enforce||!data.fields.printCount||permits(user,'d:'+data.type,'reprint'),'没有重复打印权限：'+data.fields.number,403);
-    return {data,template,pages:paginatePrint(template,data)};
+    if(!includePages)validatePrintTemplate(template);
+    return {data,template,...(includePages?{pages:paginatePrint(template,data)}:{})};
   });
 }
 export function recordPrint(s,user,input) {

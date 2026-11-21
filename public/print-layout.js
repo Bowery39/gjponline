@@ -80,7 +80,7 @@ export function validatePrintTemplate(value) {
     if (!el||typeof el.id!=='string'||!/^[a-zA-Z0-9_-]{1,80}$/.test(el.id)||ids.has(el.id)||!['field','text','line','rect','image','barcode','qr','page','time','expression'].includes(el.kind)) fail('模板元素无效或编号重复');
     ids.add(el.id);
     if (!printBands.includes(el.band)||!['x','y','w','h'].every(key=>finite(el[key],0,1000))||el.w<0.1||el.h<0.1) fail('元素位置或尺寸无效');
-    if (el.x+el.w>width+0.01||el.y+el.h>l.bands[el.band]+0.01) fail('元素超出所在区域，请调整纸张、区域或元素尺寸');
+    if (el.visible!==false&&(el.x+el.w>width+0.01||el.y+el.h>l.bands[el.band]+0.01)) fail('元素超出所在区域，请调整纸张、区域或元素尺寸');
     if (el.kind==='field'&&!Object.hasOwn(printFields,el.key)) fail('未知打印字段');
     if (el.font!=null&&(typeof el.font!=='string'||!/^[\w\s\-\u3400-\u9fff,]+$/.test(el.font)||el.font.length>80)) fail('字体名称无效');
     if (el.fontSize!=null&&!finite(el.fontSize,5,72)) fail('字号须为 5–72');
@@ -221,27 +221,27 @@ export function cachedPrintSymbol(kind,value,build) {
   symbolCache.set(key,result);return result;
 }
 export const printSymbolCacheInfo=()=>({size:symbolCache.size,builds:symbolBuilds});
-export function renderPrintPages(template,data,{preview=true,pageMargins=false,pageIndex=null}={}) {
+export function renderPrintPages(template,data,{preview=true,pageMargins=false,pageIndex=null,preparedPages=null}={}) {
   const p=template.paper,l=template.layout;
   const left=pageMargins?0:p.margin.left,top=pageMargins?0:p.margin.top;
   const pageWidth=pageMargins?p.width-p.margin.left-p.margin.right:p.width;
   const pageHeight=pageMargins?p.height-p.margin.top-p.margin.bottom:p.height;
   const offsets={};let y=top;
   for(const band of printBands){offsets[band]=y;y+=l.bands[band];}
-  const pages=paginatePrint(template,data);
+  const pages=preparedPages||paginatePrint(template,data);
   return pages.filter((_,index)=>pageIndex==null||index===pageIndex).map(page=>{
-    const elements=l.elements.filter(el=>el.band!=='header'||page.index===1).filter(el=>el.band!=='footer'||page.last);
+    const elements=l.elements.filter(el=>el.visible!==false).filter(el=>el.band!=='header'||page.index===1).filter(el=>el.band!=='footer'||page.last);
     const markup=elements.map(el=>{
       const key=el.key||'',value=el.kind==='expression'?evaluatePrintExpression(el.expression||'0',page.fields):
         el.kind==='page'?page.fields.page:el.kind==='time'?page.fields.printTime:el.kind==='text'?el.text:page.fields[key]??page.fields.number;
       let html=escapePrint(formatPrintValue(value,el,key));
       if(el.kind==='image')html=el.asset?'<img alt="" src="/api/print-assets/'+el.asset+'">':'';
-      if(el.kind==='barcode') {
-        const bars=cachedPrintSymbol('barcode',value,()=>code39(String(value||'')));
-        if(!bars)html='<span>条码内容不支持</span>';
-        else {let x=0;const rects=bars.map((w,i)=>{const rect=i%2?'':'<rect x="'+x+'" y="0" width="'+w+'" height="30"/>';x+=w;return rect;}).join('');
-          html='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 '+x+' 36" preserveAspectRatio="none">'+rects+'<text x="'+x/2+'" y="35" text-anchor="middle" font-size="5">'+escapePrint(value)+'</text></svg>';}
-      }
+      if(el.kind==='barcode')html=cachedPrintSymbol('barcode',value,()=>{
+        const bars=code39(String(value||''));
+        if(!bars)return '<span>条码内容不支持</span>';
+        let x=0;const rects=bars.map((w,i)=>{const rect=i%2?'':'<rect x="'+x+'" y="0" width="'+w+'" height="30"/>';x+=w;return rect;}).join('');
+        return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 '+x+' 36" preserveAspectRatio="none">'+rects+'<text x="'+x/2+'" y="35" text-anchor="middle" font-size="5">'+escapePrint(value)+'</text></svg>';
+      });
       if(el.kind==='qr'){try{html=cachedPrintSymbol('qr',value,()=>qrSvg(String(value||'')));}catch{html='二维码内容过长';}}
       if(el.kind==='line'||el.kind==='rect')html='';
       return '<div class="pt-element" style="left:'+(left+el.x)+'mm;top:'+(offsets[el.band]+el.y)+'mm;width:'+el.w+'mm;height:'+el.h+'mm;'+styleOf(el)+

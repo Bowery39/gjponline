@@ -1,4 +1,4 @@
-import {printBands,normalizePrintTemplate} from './print-layout.js';
+import {printBands,normalizePrintTemplate,validatePrintTemplate} from './print-layout.js';
 export const mm=value=>Math.round((Number(value)+Number.EPSILON)*10)/10;
 const copy=value=>value===undefined?undefined:JSON.parse(JSON.stringify(value));
 export function editorNumber(value,label,{min=0,max=1000,integer=false,field=label}={}) {
@@ -10,29 +10,74 @@ export function editorNumber(value,label,{min=0,max=1000,integer=false,field=lab
 export function elementsOverlap(a,b,gap=0) {
   return a.x<b.x+b.w+gap-0.001&&a.x+a.w+gap>b.x+0.001&&a.y<b.y+b.h+gap-0.001&&a.y+a.h+gap>b.y+0.001;
 }
-export function resolvePrintOverlaps(value,{gap=1}={}) {
+const bandNames={pageHeader:'页眉',header:'表头',body:'表体明细',footer:'表尾',pageFooter:'页脚'};
+const shownElement=el=>el.visible!==false;
+export function printHeightError(value,required,focusBand='body') {
+  const height=mm(value.paper.height-value.paper.margin.top-value.paper.margin.bottom);
+  const needed=mm(required[focusBand]||0),other=printBands.filter(band=>band!==focusBand).reduce((sum,band)=>sum+(required[band]||0),0);
+  const available=mm(Math.max(0,height-other));
+  const neededPaperHeight=mm(Math.max(value.paper.height+0.1,other+needed+value.paper.margin.top+value.paper.margin.bottom));
+  return Object.assign(Error(bandNames[focusBand]+'需要 '+needed+'mm，剩余可用 '+available+'mm（纸张高度 '+value.paper.height+'mm，可打印 '+height+'mm）。可改用至少 '+neededPaperHeight+'mm 高的纸张、放到下一可用区域或缩小字号。'),
+    {code:'PRINT_HEIGHT_INSUFFICIENT',band:focusBand,requiredHeight:needed,availableHeight:available,paperHeight:value.paper.height,printableHeight:height,neededPaperHeight,actions:['taller','next','shrink']});
+}
+export function resolvePrintOverlaps(value,{gap=1,focusBand}={}) {
   Object.assign(value,normalizePrintTemplate(value));
   const l=value.layout,height=mm(value.paper.height-value.paper.margin.top-value.paper.margin.bottom);
+  const table=l.table,minBody=mm(table.headerHeight+table.rowHeight*(1+Number(!!table.total)+Number(!!table.subtotal)));
+  const groups=Object.fromEntries(printBands.map(band=>[band,l.elements.filter(el=>el.band===band&&shownElement(el)).map((el,index)=>({el,index})).sort((a,b)=>a.el.y-b.el.y||a.el.x-b.el.x||a.index-b.index).map(row=>row.el)]));
+  const ends=()=>Object.fromEntries(printBands.map(band=>[band,mm(Math.max(band==='body'?minBody:0,...groups[band].map(el=>el.y+el.h)))]));
   for(const band of printBands){
-    const sorted=l.elements.filter(el=>el.band===band).map((el,index)=>({el,index}))
-      .sort((a,b)=>a.el.y-b.el.y||a.el.x-b.el.x||a.index-b.index);
     const placed=[];
-    for(const {el} of sorted){
+    for(const el of groups[band]){
       let collisions;
-      while((collisions=placed.filter(other=>elementsOverlap(el,other))).length)
-        el.y=mm(Math.max(...collisions.map(other=>other.y+other.h))+gap);
+      while((collisions=placed.filter(other=>elementsOverlap(el,other))).length)el.y=mm(Math.max(...collisions.map(other=>other.y+other.h))+gap);
       placed.push(el);
     }
-    l.bands[band]=mm(Math.max(l.bands[band],...l.elements.filter(el=>el.band===band).map(el=>el.y+el.h)));
   }
-  const other=printBands.filter(band=>band!=='body').reduce((sum,band)=>sum+l.bands[band],0);
-  l.bands.body=mm(Math.min(l.bands.body,height-other));
-  const t=l.table,minBody=t.headerHeight+t.rowHeight*(1+Number(!!t.total)+Number(!!t.subtotal));
-  const bodyEnd=Math.max(0,...l.elements.filter(el=>el.band==='body').map(el=>el.y+el.h));
-  if(l.bands.body<minBody-0.01||l.bands.body<bodyEnd-0.01)throw Error('纸张高度不足以容纳适配后的元素，请增大纸张、减小字号或减少元素');
-  const capacity=Math.floor((l.bands.body-t.headerHeight-(t.subtotal?t.rowHeight:0)-(t.total?t.rowHeight:0))/t.rowHeight);
-  if(t.rowsPerPage>capacity)t.rowsPerPage=0;
+  let required=ends();
+  // A taller target page can still overflow when proportional scaling expands
+  // empty gaps. Compact rows only when needed, retaining left-to-right order.
+  if(Object.values(required).reduce((sum,n)=>sum+n,0)>height+0.01){
+    for(const band of printBands){
+      let row=[],y=0,rowEnd=0;
+      for(const el of groups[band]){
+        if(row.some(other=>el.x<other.x+other.w-0.001&&el.x+el.w>other.x+0.001)){y=mm(rowEnd+gap);row=[];}
+        el.y=y;row.push(el);rowEnd=Math.max(rowEnd,el.y+el.h);
+      }
+    }
+    required=ends();
+  }
+  const total=Object.values(required).reduce((sum,n)=>sum+n,0);
+  if(total>height+0.01){
+    focusBand??=printBands.reduce((best,band)=>required[band]-(l.bands[band]||0)>required[best]-(l.bands[best]||0)?band:best,'body');
+    throw printHeightError(value,required,focusBand);
+  }
+  const allocated=Object.fromEntries(printBands.map(band=>[band,mm(Math.max(l.bands[band],required[band]))]));
+  let excess=mm(Object.values(allocated).reduce((sum,n)=>sum+n,0)-height);
+  // Reclaim genuine empty space, first in the detail band then other bands.
+  for(const band of ['body',...printBands.filter(b=>b!=='body')]){
+    if(excess<=0)break;
+    const reclaimed=Math.min(excess,mm(allocated[band]-required[band]));allocated[band]=mm(allocated[band]-reclaimed);excess=mm(excess-reclaimed);
+  }
+  l.bands=allocated;
+  const capacity=Math.floor((l.bands.body-table.headerHeight-(table.subtotal?table.rowHeight:0)-(table.total?table.rowHeight:0))/table.rowHeight);
+  if(table.rowsPerPage>capacity)table.rowsPerPage=0;
   return Object.assign(value,normalizePrintTemplate(value));
+}
+export function createPrintSavePreparation() {
+  let source,snapshot;let builds=0;
+  return {
+    accept(value){source=value;snapshot=normalizePrintTemplate(value);return snapshot;},
+    invalidate(){source=snapshot=null;},
+    prepare(value){if(source===value&&snapshot)return snapshot;const next=normalizePrintTemplate(value);validatePrintTemplate(next);builds++;source=value;snapshot=next;return next;},
+    stats:()=>({builds})
+  };
+}
+export function createPrintTrace(operation,{clock=()=>performance.now(),report=entry=>console.info(JSON.stringify(entry))}={}) {
+  const start=clock(),stages={};
+  return {sync(name,action){const at=clock();try{return action();}finally{stages[name]=Math.round((clock()-at)*10)/10;}},
+    async run(name,action){const at=clock();try{return await action();}finally{stages[name]=Math.round((clock()-at)*10)/10;}},
+    finish(extra={}){const entry={event:'print_client',operation,total_ms:Math.round((clock()-start)*10)/10,stages,...extra};report(entry);return entry;}}
 }
 export function updatePrintElement(value,id,raw) {
   const next=copy(value),el=next.layout.elements.find(el=>el.id===id);

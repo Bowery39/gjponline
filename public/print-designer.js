@@ -1,4 +1,4 @@
-import {mm,elementsOverlap,resolvePrintOverlaps,updatePrintElement,createTemplateSaver,createPrintToast,updatePrintPagination,printPaperFromInput,bindPrintFieldDrag,printDropPosition,bindPrintCanvasDrop,exportPrintDesign} from './print-editor.js';
+import {mm,elementsOverlap,resolvePrintOverlaps,updatePrintElement,createTemplateSaver,createPrintToast,updatePrintPagination,printPaperFromInput,bindPrintFieldDrag,printDropPosition,bindPrintCanvasDrop,exportPrintDesign,createPrintSavePreparation,createPrintTrace} from './print-editor.js';
 import {printTemplateDocuments} from './print-output.js';
 import {families} from './catalog.js';
 import {defaultPrintTemplate,validatePrintTemplate,printFields,printLineFields,printBands,paperPresets,escapePrint as esc,
@@ -39,11 +39,12 @@ export function fitPrintPaper(value,paper,{keepFontSize=false}={}) {
   const oldBands={...value.layout.bands};
   const next=Object.fromEntries(printBands.map(band=>[band,oldBands[band]*scale]));
   for(const el of value.layout.elements){
+    if(el.visible===false)continue;
     el.x=el.x/oldWidth*width;el.w=el.w/oldWidth*width;el.y*=scale;el.h*=scale;
     const title=['companyName','documentName'].includes(el.key)||['company','title'].includes(el.id);
     if(!keepFontSize)el.fontSize=Math.max(title?12:9,Math.min(72,(el.fontSize||10)*Math.min(scale,width/oldWidth)));
     if(!['line','rect','image','barcode','qr'].includes(el.kind))el.h=Math.min(next[el.band],Math.max(el.h,(el.fontSize||10)*25.4/72*1.2));
-    el.y=Math.max(0,Math.min(el.y,next[el.band]-el.h));
+    if(el.visible!==false)el.y=Math.max(0,Math.min(el.y,next[el.band]-el.h));
   }
   for(const el of value.layout.elements){for(const key of ['x','y','w','h'])el[key]=Math.max(key==='w'||key==='h'?0.1:0,mm(el[key]));if(el.fontSize!=null)el.fontSize=mm(el.fontSize);}
   for(const band of printBands)next[band]=mm(next[band]);
@@ -55,14 +56,14 @@ export function fitPrintPaper(value,paper,{keepFontSize=false}={}) {
   resolvePrintOverlaps(value);
   validatePrintTemplate(value);Object.assign(target,value);
 }
-export function createPrintElement(value,kind,{key,band='header',position,anchor,viewport,id=uid()}={}) {
+export function createPrintElement(value,kind,{key,band='header',position,anchor,viewport,id=uid(),dimensions}={}) {
   const width=value.paper.width-value.paper.margin.left-value.paper.margin.right,height=value.layout.bands[band];
   if(height<1)throw Error('此区域高度为零');
   const sizes={line:[35,0.5],rect:[35,14],image:[25,20],barcode:[45,14],qr:[20,20],page:[40,7]};
-  const [w,h]=(sizes[kind]||[35,7]).map((n,i)=>Math.min(n,i?height:width));
+  const [w,h]=(dimensions||sizes[kind]||[35,7]).map((n,i)=>Math.min(n,i?height:width));
   const grid=value.layout.grid||2;
   const clamp=(x,y)=>({x:mm(Math.max(0,Math.min(x,width-w))),y:mm(Math.max(0,Math.min(y,height-h)))});
-  const occupied=value.layout.elements.filter(el=>el.band===band);
+  const occupied=value.layout.elements.filter(el=>el.band===band&&el.visible!==false);
   if(band==='body')occupied.push({x:0,y:0,w:width,h:value.layout.table.headerHeight});
   const free=point=>!occupied.some(el=>elementsOverlap({...point,w,h},el,0.5));
   const snap=n=>Math.ceil(n/grid)*grid;
@@ -88,14 +89,42 @@ export function insertPrintElementWithSpace(value,kind,options,strategy='expand'
   const candidates=strategy==='next'?[...printBands.slice(printBands.indexOf(band)+1),...printBands.slice(0,printBands.indexOf(band))]:[band];
   if(strategy==='expand')next.layout.bands[band]=mm(next.layout.bands[band]+30);
   for(const target of candidates){
+    if(next.layout.bands[target]<1)continue;
     try{
       const element=createPrintElement(next,kind,{key:options.key,band:target});
       next.layout.elements.push(element);
-      if(strategy==='expand')resolvePrintOverlaps(next);
+      if(strategy==='expand')resolvePrintOverlaps(next,{focusBand:band});
       validatePrintTemplate(next);return {value:normalizePrintTemplate(next),element};
     }catch(error){if(strategy!=='next'||error.code!=='PRINT_BAND_FULL')throw error;}
   }
   throw Error('没有可用区域，请增大纸张或调整区域高度后重试');
+}
+export function suggestTallerPrintPaper(value,error) {
+  const height=Math.ceil(Math.max(error.neededPaperHeight||0,value.paper.height+10)*10)/10;
+  if(height>1000)throw Error('所需高度超过1000mm，请换区或缩小字号');
+  return {...copy(value.paper),preset:'custom',height,orientation:value.paper.width>height?'landscape':'portrait'};
+}
+export function shrinkPrintBand(value,band) {
+  const next=copy(value);let changed=false;
+  for(const el of next.layout.elements.filter(el=>el.band===band&&el.visible!==false&&!['qr','barcode','image','rect','line'].includes(el.kind))){
+    const minimum=['documentName','companyName'].includes(el.key)?12:9,previous=el.fontSize||10,size=Math.max(minimum,mm(previous*0.9));
+    if(size>=previous)continue;
+    el.fontSize=size;el.h=mm(Math.max(size*25.4/72*1.2,el.h*size/previous));changed=true;
+  }
+  if(!changed)throw Error('当前区域文字已达到最小字号，请改用更高纸张或放到下一可用区域');
+  resolvePrintOverlaps(next,{focusBand:band});validatePrintTemplate(next);return next;
+}
+export function movePrintElementToAvailableBand(value,id) {
+  const next=copy(value),element=next.layout.elements.find(el=>el.id===id);
+  if(!element)throw Error('请先选中需要换区的元素');
+  next.layout.elements=next.layout.elements.filter(el=>el.id!==id);
+  const order=[...printBands.slice(printBands.indexOf(element.band)+1),...printBands.slice(0,printBands.indexOf(element.band))];
+  for(const band of order){
+    if(next.layout.bands[band]<element.h)continue;
+    try{const location=createPrintElement(next,element.kind,{band,id:element.id,dimensions:[element.w,element.h]});const moved={...element,x:location.x,y:location.y,band};next.layout.elements.push(moved);validatePrintTemplate(next);return {value:next,element:moved};}
+    catch(error){if(error.code!=='PRINT_BAND_FULL')throw error;}
+  }
+  throw Error('其他区域也没有足够空间，请改用更高纸张或缩小字号');
 }
 export function createPrintTaskRunner(setBusy,onError) {
   let busy=false;
@@ -143,13 +172,13 @@ export function renderPrintElementProperties(el,count=1){
 export async function renderTemplateCenter(host,{api,showError,showSystemPrompt,canDesign}) {
   let type='sale',rows=[],selected=null,draft=null,ids=new Set(),clipboard=[],history=[],cursor=-1,zoom=0.8,dirty=false,busy=false,selectedBand='header';
   const alive=()=>host.isConnected;
-  const toast=createPrintToast(),persist=createTemplateSaver(api,{onRetry:message=>toast(message)}),panels=new Map(),latestDocuments=new Map();
+  const toast=createPrintToast(),persist=createTemplateSaver(api,{onRetry:message=>toast(message)}),panels=new Map(),savePreparation=createPrintSavePreparation();
   const readPanel=form=>Object.fromEntries([...form.querySelectorAll('[name]')].map(input=>[input.name,input.type==='checkbox'?input.checked:input.value]));
   const watchPanel=(form,key)=>{
     form.noValidate=true;
     const pending=panels.get(key);
     if(pending)for(const input of form.querySelectorAll('[name]'))if(Object.hasOwn(pending,input.name)){if(input.type==='checkbox')input.checked=pending[input.name];else input.value=pending[input.name];}
-    const capture=()=>{panels.set(key,readPanel(form));dirty=true;};
+    const capture=()=>{panels.set(key,readPanel(form));dirty=true;savePreparation.invalidate();};
     form.addEventListener('input',capture);form.addEventListener('change',capture);
     if(!form.querySelector('.pt-form-error')){const output=document.createElement('output');output.className='pt-form-error';output.setAttribute('aria-live','polite');form.append(output);}
   };
@@ -176,7 +205,7 @@ export async function renderTemplateCenter(host,{api,showError,showSystemPrompt,
   const remember=()=>{
     const text=JSON.stringify(draft);
     if(history[cursor]===text)return;
-    history=history.slice(0,cursor+1);history.push(text);
+    savePreparation.invalidate();history=history.slice(0,cursor+1);history.push(text);
     if(history.length>80)history.shift();
     cursor=history.length-1;dirty=true;
   };
@@ -188,7 +217,7 @@ export async function renderTemplateCenter(host,{api,showError,showSystemPrompt,
       else if(disabledControls.has(control)){control.disabled=disabledControls.get(control);disabledControls.delete(control);}
     }
   };
-  const reportDesignerError=error=>{if(error.code?.startsWith('TEMPLATE_'))return toast(error.message);if(error.code==='PRINT_BAND_FULL'){toast(error.message);showInsertionOptions();return;}return showError(error);};
+  const reportDesignerError=error=>{if(error.code?.startsWith('TEMPLATE_'))return toast(error.message);if(error.code==='PRINT_BAND_FULL'){toast(error.message);showInsertionOptions();return;}if(error.code==='PRINT_HEIGHT_INSUFFICIENT'){toast(error.message);showHeightOptions(error);return;}return showError(error);};
   const run=createPrintTaskRunner(setBusy,reportDesignerError);
   const act=action=>event=>{if(event?.type==='submit')event.preventDefault();return run(()=>action(event));};
   const draw=()=>{
@@ -237,7 +266,7 @@ export async function renderTemplateCenter(host,{api,showError,showSystemPrompt,
     canvas.innerHTML=(l.background?'<img class="pt-background" alt="" src="/api/print-assets/'+l.background+'">':'')+
       printBands.map(band=>{
         const top=y;y+=l.bands[band];
-        const elements=l.elements.filter(el=>el.band===band).map(el=>{
+        const elements=l.elements.filter(el=>el.band===band&&el.visible!==false).map(el=>{
           const text=el.kind==='field'?printFields[el.key]:el.kind==='text'?el.text:el.kind==='expression'?el.expression:
             ({line:'',rect:'',image:'图片',barcode:'▥ 单据编号',qr:'▦ 二维码',page:'第 N 页 / 共 M 页',time:'打印时间'})[el.kind];
           return '<div tabindex="0" data-element="'+el.id+'" class="pt-design-element '+(ids.has(el.id)?'selected':'')+
@@ -355,7 +384,30 @@ export async function renderTemplateCenter(host,{api,showError,showSystemPrompt,
     const area=document.createElement('div');area.className='pt-insert-options';area.setAttribute('role','group');area.setAttribute('aria-label','区域已满的处理选项');
     for(const [strategy,title] of [['expand','自动扩展当前区域'],['next','放到下一可用区域']]){
       const control=document.createElement('button');control.type='button';control.className='btn';control.textContent=title;
-      control.onclick=()=>{try{const result=insertPrintElementWithSpace(draft,pendingInsertion.kind,pendingInsertion,strategy);draft=result.value;ids=new Set([result.element.id]);selectedBand=result.element.band;remember();drawCanvas();drawProperties();refreshPaperPanels();host.querySelector('#pt-band').value=selectedBand;area.remove();toast('已调整并插入元素，尚未保存');}catch(error){toast(error.message);}};
+      control.onclick=()=>{try{const result=insertPrintElementWithSpace(draft,pendingInsertion.kind,pendingInsertion,strategy);draft=result.value;ids=new Set([result.element.id]);selectedBand=result.element.band;remember();drawCanvas();drawProperties();refreshPaperPanels();host.querySelector('#pt-band').value=selectedBand;area.remove();toast('已调整并插入元素，尚未保存');}catch(error){toast(error.message);if(error.code==='PRINT_HEIGHT_INSUFFICIENT')showHeightOptions(error,true);}};
+      area.append(control);
+    }
+    host.querySelector('.pt-design-main > .toolbar').append(area);
+  }
+  function showHeightOptions(error,inserting=false){
+    host.querySelector('.pt-height-options')?.remove();
+    const area=document.createElement('div');area.className='pt-insert-options pt-height-options';area.setAttribute('role','group');area.setAttribute('aria-label','纸张高度不足的处理选项');
+    const message=document.createElement('span');message.textContent=error.message;area.append(message);
+    const adopt=(value,element)=>{draft=value;if(element){ids=new Set([element.id]);selectedBand=element.band;}remember();drawCanvas();drawProperties();refreshPaperPanels();area.remove();toast('布局已调整到本地草稿，尚未保存');};
+    for(const [action,title] of [['taller','改用更高纸张'],['next','放到下一可用区域'],['shrink','缩小字号']]){
+      const control=document.createElement('button');control.type='button';control.className='btn';control.textContent=title;
+      control.onclick=()=>{try{
+        if(action==='taller'){
+          const form=host.querySelector('#pt-paper-form'),base={...draft.paper,width:Number(form.elements.width.value),height:Number(form.elements.height.value)},paper=suggestTallerPrintPaper(base,error);
+          form.elements.height.value=paper.height;form.elements.preset.value='custom';form.elements.orientation.value=paper.orientation;panels.set('paper',readPanel(form));dirty=true;savePreparation.invalidate();toast('已填入 '+paper.height+'mm 高度，请点击「应用纸张设置」');return;
+        }
+        if(action==='next'){
+          const result=inserting&&pendingInsertion?insertPrintElementWithSpace(draft,pendingInsertion.kind,pendingInsertion,'next'):movePrintElementToAvailableBand(draft,[...ids][0]||draft.layout.elements.filter(el=>el.band===error.band&&el.visible!==false).at(-1)?.id);
+          adopt(result.value,result.element);return;
+        }
+        const smaller=shrinkPrintBand(draft,error.band);
+        if(inserting&&pendingInsertion){try{const result=insertPrintElementWithSpace(smaller,pendingInsertion.kind,pendingInsertion,'expand');adopt(result.value,result.element);}catch(problem){adopt(smaller);if(problem.code==='PRINT_HEIGHT_INSUFFICIENT')showHeightOptions(problem,true);toast('字号已缩小；'+problem.message);}}else adopt(smaller);
+      }catch(problem){toast(problem.message);}};
       area.append(control);
     }
     host.querySelector('.pt-design-main > .toolbar').append(area);
@@ -384,26 +436,34 @@ export async function renderTemplateCenter(host,{api,showError,showSystemPrompt,
     remember();drawCanvas();drawProperties();}
   function remove(){for(const id of ids)panels.delete('element:'+id);draft.layout.elements=draft.layout.elements.filter(el=>!ids.has(el.id));ids.clear();remember();drawCanvas();drawProperties();}
   async function save({collect=true}={}){
-    const started=performance.now();
-    const candidate=normalizePrintTemplate(collect?collectPanels():draft);validatePrintTemplate(candidate);
-    const result=await persist(candidate);
-    selected=result;draft=copy(result);dirty=false;panels.clear();
-    const index=rows.findIndex(row=>row.id===result.id);if(index>=0)rows[index]=result;
-    history=[JSON.stringify(draft)];cursor=0;
-    const tab=host.querySelector('[data-template="'+result.id+'"]');if(tab)tab.textContent=result.name+(result.is_default?'（默认）':'');
-    // Keep the canvas, scroll positions, selection and property inputs in place.
-    drawCanvas();const selectedId=[...ids][0];if(selectedId)drawProperties();refreshPaperPanels();
-    host.dataset.saveMilliseconds=String(Math.round(performance.now()-started));
-    toast('打印模板已保存');return result;
+    const trace=createPrintTrace('template_save'),started=performance.now(),hadPending=panels.size>0;
+    try{
+      const candidate=trace.sync('prepare_ms',()=>collect&&panels.size?savePreparation.prepare(collectPanels()):savePreparation.prepare(draft));
+      const result=await trace.run('queue_http_ms',()=>persist(candidate));
+      trace.sync('update_dom_ms',()=>{
+        const changed=JSON.stringify([draft.paper,draft.layout])!==JSON.stringify([result.paper,result.layout]);
+        selected=result;
+        // Retain canvas handler references when only revision metadata changed.
+        if(changed)draft=copy(result);else Object.assign(draft,{...result,paper:draft.paper,layout:draft.layout});
+        dirty=false;panels.clear();
+        const index=rows.findIndex(row=>row.id===result.id);if(index>=0)rows[index]=result;
+        history=[JSON.stringify(draft)];cursor=0;savePreparation.accept(draft);
+        const tab=host.querySelector('[data-template="'+result.id+'"]');if(tab)tab.textContent=result.name+(result.is_default?'（默认）':'');
+        if(changed)drawCanvas();
+        if((changed||hadPending)&&ids.size)drawProperties();
+        if(changed||hadPending)refreshPaperPanels();
+      });
+      host.dataset.saveMilliseconds=String(Math.round(performance.now()-started));
+      toast('打印模板已保存');trace.finish({status:200,template_id:result.id});return result;
+    }catch(error){trace.finish({status:error.status||0,error_code:error.code});throw error;}
   }
   async function preview(){
-    const started=performance.now();
-    if(dirty||panels.size)await save();
-    let id=latestDocuments.get(type);
-    if(!id){const result=await api('/api/documents?type='+type+'&page=1');id=result.rows[0]?.id;if(id)latestDocuments.set(type,id);}
-    if(!id)throw Error('请先保存一张此类型单据，再预览真实数据');
-    await showPrintPreview([id],{api,showError,showSystemPrompt}, {[type]:selected.id});
-    host.dataset.previewMilliseconds=String(Math.round(performance.now()-started));
+    const trace=createPrintTrace('template_preview'),started=performance.now();
+    try{
+      if(dirty||panels.size)await trace.run('save_ms',()=>save());
+      await trace.run('load_and_render_ms',()=>showPrintPreview(null,{api,showError,showSystemPrompt,latestType:type,knownTemplates:{[type]:rows}}, {[type]:selected.id}));
+      host.dataset.previewMilliseconds=String(Math.round(performance.now()-started));trace.finish({status:200,doc_type:type});
+    }catch(error){trace.finish({status:error.status||0,error_code:error.code});throw error;}
   }
   const bind=()=>{
     host.querySelector('#pt-type').addEventListener('change',act(async event=>{
@@ -438,10 +498,10 @@ export async function renderTemplateCenter(host,{api,showError,showSystemPrompt,
         // Apply pending element edits before scaling them; no form is discarded on failure.
         for(const [key,raw] of panels)if(key!=='paper')next=applyPanel(next,key,raw);
         next=applyPanel(next,'paper',readPanel(paperForm));validatePrintTemplate(next);
-        draft=next;panels.clear();remember();drawCanvas();drawProperties();drawColumns();refreshPaperPanels();
+        draft=next;panels.clear();remember();drawCanvas();drawProperties();drawColumns();refreshPaperPanels();savePreparation.accept(draft);
         host.querySelector('#pt-paper-status').textContent='纸张已应用到本地草稿，尚未保存';
         toast('纸张设置已应用到草稿，请点击「保存模板」');
-      }catch(error){panelError(paperForm,error);}
+      }catch(error){panelError(paperForm,error);if(error.code==='PRINT_HEIGHT_INSUFFICIENT')showHeightOptions(error);}
     }));
     const paginationForm=host.querySelector('#pt-pagination-form');watchPanel(paginationForm,'pagination');
     paginationForm.addEventListener('submit',act(async event=>{
@@ -521,7 +581,7 @@ export async function renderTemplateCenter(host,{api,showError,showSystemPrompt,
       toast(action==='default'?'已设为默认打印模板':action==='delete'?'打印模板已删除':'已恢复系统默认布局');
     })));
   };
-  function select(value){panels.clear();selected=normalizePrintTemplate(value);draft=copy(selected);persist.remember?.(selected);draft.paper.orientation=paperOrientation(draft.paper);ids.clear();history=[JSON.stringify(draft)];cursor=0;dirty=false;draw();}
+  function select(value){savePreparation.invalidate();panels.clear();selected=normalizePrintTemplate(value);draft=copy(selected);persist.remember?.(selected);draft.paper.orientation=paperOrientation(draft.paper);ids.clear();history=[JSON.stringify(draft)];cursor=0;dirty=false;draw();}
   async function load(id){rows=(await api('/api/print-templates?type='+type)).rows;if(!rows.length)throw Error('没有可用打印模板');select(rows.find(row=>row.id===id)||rows[0]);}
   if(!canDesign){host.innerHTML='<p>没有打印模板设计权限</p>';return;}
   await load();
@@ -539,10 +599,12 @@ function askName(current) {
     dialog.addEventListener('close',()=>{const value=dialog.returnValue==='save'?dialog.querySelector('input').value.trim():null;dialog.remove();resolve(value);},{once:true});
   });
 }
-export async function showPrintPreview(ids,{api,showError,showSystemPrompt,beforePrint},initial={}) {
+export async function showPrintPreview(ids,{api,showError,showSystemPrompt,beforePrint,latestType,knownTemplates},initial={}) {
   const dialog=document.createElement('dialog');dialog.className='pt-preview-dialog';
-  const response=await api('/api/print/preview',{ids,templates:initial}),values=response.documents;
-  const types=[...new Set(values.map(item=>item.data.type))],available=response.templates||{};
+  const trace=createPrintTrace('preview_render');
+  const response=await trace.run('http_ms',()=>api('/api/print/preview',{...(ids?{ids}:{latestType}),templates:initial,compact:true,includeTemplates:!knownTemplates})),values=response.documents;
+  ids=values.map(row=>row.data.id);
+  const types=[...new Set(values.map(item=>item.data.type))],available=knownTemplates||response.templates||{};
   await Promise.all(types.filter(type=>!available[type]).map(async type=>{available[type]=(await api('/api/print-templates?type='+type)).rows;}));
   let templates={...Object.fromEntries(values.map(item=>[item.data.type,item.template.id])),...initial},documents=values,page=0,zoom=0.8,busy=false;
   dialog.innerHTML='<header><h2>打印预览</h2><button class="btn" id="pt-close">关闭</button></header><div class="toolbar">'+types.map(type=>
@@ -554,21 +616,21 @@ export async function showPrintPreview(ids,{api,showError,showSystemPrompt,befor
   dialog.querySelector('#pt-close').onclick=()=>{if(!busy){dialog.close();dialog.remove();}};
   let renderedDocuments,pageItems=[],pageCache=new Map();
   const draw=()=>{
-    if(renderedDocuments!==documents){renderedDocuments=documents;pageCache.clear();pageItems=documents.flatMap(({template,data})=>paginatePrint(template,data).map((_,index)=>({template,data,index})));}
+    if(renderedDocuments!==documents){renderedDocuments=documents;pageCache.clear();pageItems=documents.flatMap(({template,data})=>{const preparedPages=paginatePrint(template,data);return preparedPages.map((_,index)=>({template,data,index,preparedPages}));});}
     page=Math.max(0,Math.min(page,pageItems.length-1));
     const item=pageItems[page],container=dialog.querySelector('.pt-preview-scroll');
-    const wrapper=document.createElement('div');if(!pageCache.has(page))pageCache.set(page,renderPrintPages(item.template,item.data,{preview:true,pageIndex:item.index}));wrapper.innerHTML=pageCache.get(page);
-    const section=wrapper.firstElementChild;
+    if(!pageCache.has(page)){const wrapper=document.createElement('div');wrapper.innerHTML=renderPrintPages(item.template,item.data,{preview:true,pageIndex:item.index,preparedPages:item.preparedPages});if(pageCache.size>=8)pageCache.delete(pageCache.keys().next().value);pageCache.set(page,wrapper.firstElementChild);}
+    const section=pageCache.get(page);
     section.style.transform='scale('+zoom+')';section.style.transformOrigin='top left';
     container.replaceChildren(section);
     dialog.querySelector('#pt-page-status').textContent='第 '+(page+1)+' / '+pageItems.length+' 页';
   };
   dialog.querySelectorAll('[data-preview-type]').forEach(select=>select.addEventListener('change',async()=>{
     if(busy)return;setPreviewBusy(true);
-    try {templates[select.dataset.previewType]=Number(select.value);documents=(await api('/api/print/preview',{ids,templates})).documents;page=0;draw();}
+    try {templates[select.dataset.previewType]=Number(select.value);documents=(await api('/api/print/preview',{ids,templates,compact:true,includeTemplates:false})).documents;page=0;draw();}
     catch(error){await showError(error);}finally{setPreviewBusy(false);}
   }));
-  dialog.querySelector('#pt-preview-zoom').onchange=event=>{zoom=Number(event.target.value);draw();};
+  dialog.querySelector('#pt-preview-zoom').onchange=event=>{zoom=Number(event.target.value);const section=dialog.querySelector('.pt-preview-scroll .pt-page');if(section)section.style.transform='scale('+zoom+')';};
   for(const el of dialog.querySelectorAll('[data-pt]'))el.onclick=async()=>{
     if(busy)return;setPreviewBusy(true);
     try{
@@ -580,13 +642,13 @@ export async function showPrintPreview(ids,{api,showError,showSystemPrompt,befor
       }
       if(action==='print'||action==='pdf'){
         if(beforePrint&&documents.some(row=>row.template.layout.autoSave))await beforePrint();
-        documents=(await api('/api/print/preview',{ids,templates})).documents;
+        documents=(await api('/api/print/preview',{ids,templates,compact:true,includeTemplates:false})).documents;
         // Snapshot the pages before recording so the page itself carries the new print ordinal.
         for(const {data} of documents){data.fields.printCount++;data.fields.reprint=data.fields.printCount>1?'重打':'';}
         await printTemplateDocuments(documents,{onReady:()=>api('/api/print/commit',{ids,templates,requestId:uid()})});
-        documents=(await api('/api/print/preview',{ids,templates})).documents;draw();
+        documents=(await api('/api/print/preview',{ids,templates,compact:true,includeTemplates:false})).documents;draw();
       }
     }catch(error){await showError(error);}finally{setPreviewBusy(false);}
   };
-  draw();
+  trace.sync('dom_and_pagination_ms',draw);trace.finish({documents:documents.length});
 }

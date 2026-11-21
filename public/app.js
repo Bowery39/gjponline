@@ -9,6 +9,8 @@ import { productUnits, unitDetails, defaultProductUnit } from './units.js';
 import { code39 } from './barcode.js';
 import { showDocumentPicker, closePicker } from './document-picker.js';
 
+const appVersion=document.querySelector('meta[name="application-version"]')?.content||'';
+const versionBadge=()=>appVersion?'<small class="app-version" aria-label="系统版本 '+e(appVersion)+'" title="系统版本">v'+e(appVersion)+'</small>':'';
 const root=document.querySelector('#app');
 const dialog=document.querySelector('#editor');
 const systemPrompt=document.querySelector('#system-prompt');
@@ -103,14 +105,17 @@ const skeleton=()=>'<div class="skeleton" aria-label="正在查询">'+Array(5).f
 const exportLink=(base,params)=>'<a class="btn" data-act="download-file" href="'+e(base+'?'+searchParams({...params,export:'1'}))+'">导出 Excel</a>';
 const menu=(text,buttons)=>'<details class="details-menu"><summary class="btn">'+e(text)+' ⌄</summary><div class="menu-list">'+buttons.join('')+'</div></details>';
 async function api(path,values,binary=false,method='POST') {
-  let response;
+  let response;const printTimed=/^\/api\/(?:print-templates|print\/preview)/.test(path),requestStarted=performance.now();
+  const serializeStarted=performance.now(),payload=values===undefined?undefined:JSON.stringify(values),serializeMs=performance.now()-serializeStarted;
   try {
-    response=await fetch(path,values===undefined?{}:{method,headers:{'Content-Type':'application/json'},body:JSON.stringify(values)});
+    response=await fetch(path,values===undefined?{}:{method,headers:{'Content-Type':'application/json'},body:payload});
   } catch {
     throw Error('无法连接系统，请检查网络后重试。');
   }
   if(binary&&response.ok)return response.blob();
+  const responseAt=performance.now();
   const data=await response.json().catch(()=>{throw Error('系统暂时无法响应，请稍后重试。');});
+  if(printTimed)console.info(JSON.stringify({event:'print_http_client',path:path.split('?')[0],method:values===undefined?'GET':method,status:response.status,serialize_ms:Math.round(serializeMs*10)/10,network_ms:Math.round((responseAt-requestStarted)*10)/10,parse_ms:Math.round((performance.now()-responseAt)*10)/10,server_timing:response.headers.get('Server-Timing')}));
   if (!response.ok) {
     if (response.status===401&&state.user) {state.user=null;showLogin();}
     throw Object.assign(Error(data.message||data.error||'请求失败'),{status:response.status,code:data.code,field:data.field,documentId:data.documentId});
@@ -124,7 +129,7 @@ function showLogin() {
   documentEditor.replaceChildren();
   state.editor=null;
   if (dialog.open) dialog.close();
-  root.innerHTML='<main class="login"><section class="login-art"><h1>零售批发进销存系统</h1><p>管理门店与仓库的采购、销售、库存和资金往来。</p></section><section class="login-side"><h2>登录工作台</h2><form novalidate id="login-form">'+field('用户名',input('username','','required autocomplete="username"'),true)+field('密码',input('password','','required type="password" autocomplete="current-password"'),true)+'<button class="btn primary">登录</button></form></section></main>';
+  root.innerHTML='<main class="login"><section class="login-art"><h1>零售批发进销存系统</h1>'+versionBadge()+'<p>管理门店与仓库的采购、销售、库存和资金往来。</p></section><section class="login-side"><h2>登录工作台</h2><form novalidate id="login-form">'+field('用户名',input('username','','required autocomplete="username"'),true)+field('密码',input('password','','required type="password" autocomplete="current-password"'),true)+'<button class="btn primary">登录</button></form></section></main>';
   document.querySelector('#login-form').addEventListener('submit', async event=>{
     event.preventDefault();
     const form=event.currentTarget;
@@ -174,7 +179,7 @@ function shell() {
     return '<div><button class="nav-row '+(selected.group===group?'active':'')+'" aria-expanded="'+open+'" aria-label="'+e(group)+'" title="'+e(group)+'" data-act="group" data-value="'+e(group)+'"><span class="nav-icon">'+icon+'</span><span class="nav-copy">'+e(group)+'</span><span class="nav-arrow">›</span></button>'+routeButtons+'</div>';
   }).join('');
   root.innerHTML='<div class="shell '+(state.folded?'folded':'')+'"><aside class="sidebar"><div class="brand"><span class="nav-copy">零售批发进销存系统</span></div><div class="nav-caption">工作空间</div><div class="nav-scroll"><button title="工作台" class="nav-row '+(state.active==='home'?'active':'')+'" data-act="open" data-value="home">'+glyph('⌂')+'<span class="nav-copy">工作台</span></button>'+nav+'</div><div class="nav-foot"><button class="nav-row" data-act="fold" title="折叠或展开导航">'+glyph('☰')+'<span class="nav-copy">折叠导航</span></button></div></aside>'+
-    '<header class="topbar"><div class="top-heading"><span>◇</span> 零售批发进销存系统</div><div class="search">'+glyph('⌕')+'<input type="search" id="function-search" placeholder="输入关键词搜索功能" aria-label="搜索功能" autocomplete="off"><div id="search-results" class="search-results" hidden></div></div>'+
+    '<header class="topbar"><div class="top-heading"><span>◇</span> 零售批发进销存系统</div>'+versionBadge()+'<div class="search">'+glyph('⌕')+'<input type="search" id="function-search" placeholder="输入关键词搜索功能" aria-label="搜索功能" autocomplete="off"><div id="search-results" class="search-results" hidden></div></div>'+
     '<div class="profile"><button class="icon-btn" data-act="notice" aria-label="消息通知">'+glyph('♧')+'</button><span class="avatar">'+e(state.user.name.slice(0,1))+'</span><span class="profile-name">'+e(state.user.name)+'</span><button class="icon-btn" title="退出登录" aria-label="退出登录" data-act="logout">↪</button></div></header>'+
     '<div class="tabs" role="tablist"></div><main class="content" id="content"></main></div>';
   refreshTabs();

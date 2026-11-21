@@ -1,4 +1,4 @@
-import {initializePrintTemplates,listPrintTemplates,getPrintTemplate,savePrintTemplate,changePrintTemplate,savePrintAsset,exportPrintTemplate,importPrintTemplate,preparePrint,recordPrint} from './print-templates.js';
+import {initializePrintTemplates,listPrintTemplates,getPrintTemplate,savePrintTemplate,changePrintTemplate,savePrintAsset,exportPrintTemplate,importPrintTemplate,preparePrint,recordPrint,latestPrintDocumentId} from './print-templates.js';
 import {paginatePrint,printFields,evaluatePrintExpression} from '../public/print-layout.js';
 import {repairOpeningEquity} from './accounting.js';
 import {initializeOpening,openingState,isOpening,assertOpeningEditable} from './opening-state.js';
@@ -23,6 +23,8 @@ import { csvRows } from '../public/csv.js';
 import { listDocuments, report, scope } from './reports.js';
 import { families, masters, statusNames, relatedDocuments, submittedSources, orderFulfillment } from '../public/catalog.js';
 
+const packageVersion=JSON.parse(readFileSync(new URL('../package.json',import.meta.url),'utf8')).version;
+export const appVersion=typeof packageVersion==='string'&&/^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(packageVersion)?packageVersion:'0.0.0';
 const digest = token => createHash('sha256').update(token).digest('hex');
 const lifetime = 12*60*60*1000;
 const files = {
@@ -463,6 +465,7 @@ export function createApp({path=':memory:', password, demo=false, demoDocuments=
   const attempts=new Map();
   const server=createServer(async(req,res)=>{
     let authenticatedToken;
+    const stageTimings={};
     const started=performance.now(),timed=/^\/api\/(?:print-templates|print\/preview)(?:[/?]|$)/.test(req.url);
     const body=async(req,limit)=>{
       const input=await readRequestBody(req,limit);
@@ -473,8 +476,8 @@ export function createApp({path=':memory:', password, demo=false, demoDocuments=
     const sendError=(status,message,code='REQUEST_FAILED',field=null,extra={})=>
       send({error:message,code,message,field,...extra},status);
     const send=(data,status=200)=>{
-      const json=JSON.stringify(data);
-      if(timed){const duration=Math.round((performance.now()-started)*10)/10;res.setHeader('Server-Timing','print;dur='+duration);printTimingLogger?.({event:'print_api',method:req.method,path:req.url.split('?')[0],status,duration_ms:duration});}
+      const serializeStarted=performance.now(),json=JSON.stringify(data);if(timed)stageTimings.serialize_ms=Math.round((performance.now()-serializeStarted)*10)/10;
+      if(timed){const duration=Math.round((performance.now()-started)*10)/10;res.setHeader('Server-Timing','print;dur='+duration+Object.entries(stageTimings).map(([key,n])=>', '+key+';dur='+n).join(''));printTimingLogger?.({event:'print_api',method:req.method,path:req.url.split('?')[0],status,duration_ms:duration,stages:stageTimings});}
       res.writeHead(status,{'Content-Type':'application/json; charset=utf-8'});
       res.end(json);
     };
@@ -495,8 +498,10 @@ export function createApp({path=':memory:', password, demo=false, demoDocuments=
       if (method==='GET' && Object.hasOwn(files,route)) {
         const [file,contentType]=files[route];
         res.writeHead(200,{'Content-Type':contentType});
-        return res.end(readFileSync(new URL('../public/'+file,import.meta.url)));
+        const content=readFileSync(new URL('../public/'+file,import.meta.url));
+        return res.end(file==='index.html'?content.toString('utf8').replaceAll('__APP_VERSION__',appVersion):content);
       }
+      if(route==='/api/version'&&method==='GET')return send({name:'零售批发进销存系统',version:appVersion});
       if (method==='POST'||method==='PUT') {
         const origin=req.headers.origin;
         check(!origin || new URL(origin).host===req.headers.host,'请求来源无效',403);
@@ -599,11 +604,13 @@ export function createApp({path=':memory:', password, demo=false, demoDocuments=
         return res.end(output);
       }
       const templateRoute=route.match(/^\/api\/print-templates\/(\d+)$/);
-      if(templateRoute&&method==='PUT') return send(savePrintTemplate(s,user,{...await body(req,3_000_000),id:Number(templateRoute[1])}));
+      if(templateRoute&&method==='PUT'){const at=performance.now(),input=await body(req,3_000_000);stageTimings.body_ms=Math.round((performance.now()-at)*10)/10;const saveAt=performance.now(),result=savePrintTemplate(s,user,{...input,id:Number(templateRoute[1])});stageTimings.save_ms=Math.round((performance.now()-saveAt)*10)/10;return send(result);}
       if(templateRoute&&method==='GET') return send(getPrintTemplate(s,user,templateRoute[1]));
       if(templateRoute&&method==='POST') return send(changePrintTemplate(s,user,templateRoute[1],await body(req)));
       if(route==='/api/print/preview'&&method==='POST') {
-        const documents=preparePrint(s,user,await body(req),{enforce:false});
+        const input=await body(req);if(!input.ids&&input.latestType)input.ids=[latestPrintDocumentId(s,user,input.latestType)];
+        const previewAt=performance.now(),documents=preparePrint(s,user,input,{enforce:false,includePages:input.compact!==true});stageTimings.prepare_ms=Math.round((performance.now()-previewAt)*10)/10;
+        if(input.includeTemplates===false)return send({documents});
         return send({documents,templates:Object.fromEntries([...new Set(documents.map(row=>row.data.type))].map(type=>[type,listPrintTemplates(s,user,type)]))});
       }
       if(route==='/api/print/commit'&&method==='POST') return send(recordPrint(s,user,await body(req)));

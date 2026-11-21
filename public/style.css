@@ -761,3 +761,8 @@ dialog.small{width:500px}
 .pt-drag-ghost {position:fixed;z-index:2147483646;pointer-events:none;padding:5px 9px;background:#e4f0ff;border:1px solid #2861ea;color:#214875;font-size:13px}
 
 .pt-insert-options {display:flex;gap:6px;flex-wrap:wrap;width:100%;padding:5px;background:#fff8d8;border:1px solid #dfcb89}
+
+.pt-height-options > span {flex-basis:100%;white-space:normal}
+
+.app-version {display:inline-block;flex:none;white-space:nowrap;font-size:11px;font-weight:400;line-height:1.4;padding:1px 5px;border:1px solid currentColor;border-radius:3px;opacity:.85}
+.login-art .app-version {font-size:13px;margin:0 0 10px}
